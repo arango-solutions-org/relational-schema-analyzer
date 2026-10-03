@@ -94,7 +94,7 @@ way are recorded in ``docs/DESIGN-ADDENDUM-denormalization.md``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Literal, Optional, cast
+from typing import Any, Callable, Literal, Optional, Sequence, cast
 
 from pydantic import BaseModel, Field
 
@@ -2068,6 +2068,54 @@ class SnowflakeValueSampler:
             "SELECT COALESCE(AVG(IFF(CONTAINS(v, %s), 1.0, 0.0)), 0) FROM s",
             (self.limit, delimiter),
         )
+
+    # ── Key profiling probes (key_profiling.KeyProbe) ──
+
+    def column_stats(
+        self, table: str, columns: Sequence[str], *, sample: bool
+    ) -> dict[str, tuple[int, int, int]] | None:
+        """``{column: (rows, non_null, distinct)}`` in one governed query.
+
+        ``sample=True`` reads the first ``limit`` rows -- enough to *reject* a
+        column (any duplicate or NULL is conclusive); ``sample=False`` counts the
+        whole table, to *confirm* the survivors.
+        """
+        if not columns:
+            return {}
+        cols = [self._ident(c) for c in columns]
+        source = f"{self._table(table)}"
+        params: tuple = ()
+        if sample:
+            source = f"(SELECT {', '.join(cols)} FROM {self._table(table)} LIMIT %s)"
+            params = (self.limit,)
+        parts = ["COUNT(*)"] + [f"COUNT({c}), COUNT(DISTINCT {c})" for c in cols]
+        rows = self._run(f"SELECT {', '.join(parts)} FROM {source}", params)  # noqa: S608
+        if not rows:
+            return None
+        r = rows[0]
+        total = int(r[0])
+        return {
+            name: (total, int(r[1 + 2 * i]), int(r[2 + 2 * i])) for i, name in enumerate(columns)
+        }
+
+    def combo_stats(
+        self, table: str, columns: Sequence[str], *, sample: bool
+    ) -> tuple[int, int, int] | None:
+        """``(rows, rows with every column non-null, distinct non-null tuples)``."""
+        cols = [self._ident(c) for c in columns]
+        not_null = " AND ".join(f"{c} IS NOT NULL" for c in cols)
+        limit = " LIMIT %s" if sample else ""
+        params: tuple = (self.limit,) if sample else ()
+        rows = self._run(
+            f"WITH s AS (SELECT {', '.join(cols)} FROM {self._table(table)}{limit}) "  # noqa: S608
+            f"SELECT (SELECT COUNT(*) FROM s), "
+            f"(SELECT COUNT(*) FROM s WHERE {not_null}), "
+            f"(SELECT COUNT(*) FROM (SELECT DISTINCT {', '.join(cols)} FROM s WHERE {not_null}))",
+            params,
+        )
+        if not rows:
+            return None
+        return int(rows[0][0]), int(rows[0][1]), int(rows[0][2])
 
 
 def create_value_sampler(

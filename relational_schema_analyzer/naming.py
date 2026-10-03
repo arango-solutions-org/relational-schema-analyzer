@@ -49,14 +49,20 @@ def singularize(word: str) -> str:
     ``ies`` → ``y``; ``ses``/``ches``/``shes``/``xes``/``zes`` → drop ``es``; a
     trailing ``s`` (but not ``ss``) → drop ``s``. Used only for fuzzy name
     matching (e.g. ``orders`` ↔ ``order``), never for stored names.
+
+    Matching is case-insensitive and the replacement follows the case of the
+    trailing letter, so Snowflake-style ``CUSTOMERS`` singularizes like
+    ``customers``. It used to come back unchanged, which silently disabled
+    every upper-case match (the same fix as r2g-arango#4).
     """
     if not word:
         return word
-    if word.endswith("ies") and len(word) > 3:
-        return word[:-3] + "y"
-    if word.endswith(("ses", "ches", "shes", "xes", "zes")):
+    lower = word.lower()
+    if lower.endswith("ies") and len(word) > 3:
+        return word[:-3] + ("Y" if word[-1].isupper() else "y")
+    if lower.endswith(("ses", "ches", "shes", "xes", "zes")):
         return word[:-2]
-    if word.endswith("s") and not word.endswith("ss"):
+    if lower.endswith("s") and not lower.endswith("ss"):
         return word[:-1]
     return word
 
