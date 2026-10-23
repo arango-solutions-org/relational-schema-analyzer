@@ -212,3 +212,63 @@ class TestPrimaryKeyScoring:
         profile = self._Profile({"customer": ("customer_id",)})
         s = score_primary_keys(schema, profile, corpus="t")
         assert s.expected == 1, "only `customer` declares a key"
+
+
+class TestDecliningIsNotFailing:
+    """"Could not check" must not score as "got it wrong" (#27).
+
+    Pagila loaded without its data reported **recall 0.000 across 22 tables** that
+    the profiler had correctly reported as "empty table". The engine was being
+    honest and the harness punished it for it — the exact category error this
+    codebase refuses everywhere else.
+    """
+
+    class _Profile:
+        def __init__(self, best_by_table, not_evaluated=None):
+            self.candidates = {t: [object()] for t in best_by_table}
+            self._best = best_by_table
+            self.not_evaluated = not_evaluated or {}
+
+        def best(self, table):
+            cols = self._best.get(table)
+            return type("C", (), {"columns": cols})() if cols else None
+
+    def test_a_declined_table_is_not_counted_as_missed(self):
+        schema = _schema_with_one_declared_fk()  # customer + orders, both keyed
+        profile = self._Profile(
+            {"customer": ("customer_id",)}, not_evaluated={"orders": "empty table"}
+        )
+        s = score_primary_keys(schema, profile, corpus="t")
+        assert s.declined == {"orders": "empty table"}
+        assert not any(m[0] == "orders" for m in s.missed), (
+            "the profiler declined to judge `orders`; calling that a miss scores it "
+            "wrong for refusing to guess"
+        )
+
+    def test_recall_is_measured_over_what_was_attempted(self):
+        schema = _schema_with_one_declared_fk()
+        profile = self._Profile(
+            {"customer": ("customer_id",)}, not_evaluated={"orders": "empty table"}
+        )
+        s = score_primary_keys(schema, profile, corpus="t")
+        assert s.expected == 2, "both tables declare a key"
+        assert s.evaluated == 1, "but only one was attempted"
+        assert s.recall == 1.0, "and that one was found"
+
+    def test_declining_everything_is_unmeasurable_not_zero(self):
+        schema = _schema_with_one_declared_fk()
+        profile = self._Profile(
+            {}, not_evaluated={"customer": "empty table", "orders": "empty table"}
+        )
+        s = score_primary_keys(schema, profile, corpus="t")
+        assert s.evaluated == 0
+        assert s.recall is None, "nothing was attempted, so there is no recall to report"
+        assert "declined=  2" in s.line()
+
+    def test_a_wrong_answer_is_still_wrong(self):
+        """The guard must not become an excuse — only declining is exempt."""
+        schema = _schema_with_one_declared_fk()
+        profile = self._Profile({"orders": ("customer_id",)})  # wrong column
+        s = score_primary_keys(schema, profile, corpus="t")
+        assert ("orders", ("order_id",)) in s.missed
+        assert not s.declined

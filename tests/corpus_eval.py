@@ -88,6 +88,14 @@ class Score:
     correct: int
     missed: set[Item] = field(default_factory=set)
     spurious: set[Item] = field(default_factory=set)
+    #: Answers the engine **declined** to give — an empty table, a spent probe
+    #: budget, a query that failed. Counted apart from ``missed`` and excluded from
+    #: ``recall``'s denominator, because "I could not check" is not "there is
+    #: nothing there". That distinction is load-bearing everywhere else in this
+    #: codebase, and scoring it as a miss punishes the engine for being honest.
+    #: Measured: Pagila loaded without its data reported recall 0.000 across 22
+    #: tables the profiler had correctly reported as "empty table".
+    declined: dict[str, str] = field(default_factory=dict)
 
     @property
     def precision(self) -> Optional[float]:
@@ -101,15 +109,22 @@ class Score:
         return self.correct / self.proposed if self.proposed else None
 
     @property
-    def recall(self) -> Optional[float]:
-        """Of what was real, how much it found — or ``None`` if nothing was declared.
+    def evaluated(self) -> int:
+        """Known answers the engine actually attempted — the honest denominator."""
+        return self.expected - len(self.declined)
 
-        Same reasoning. A schema that declares no foreign keys has no answer to be
-        measured against, and RSA's target domain is full of them: scoring one 1.000
-        while it proposes keys that are in no truth set is the most flattering
-        possible lie.
+    @property
+    def recall(self) -> Optional[float]:
+        """Of what it attempted, how much it found — ``None`` if it attempted nothing.
+
+        A schema that declares nothing has no answer to measure against, and RSA's
+        target domain is full of them: scoring one 1.000 while the engine proposes
+        keys that are in no truth set is the most flattering possible lie.
+
+        Declined answers are out of the denominator. An empty table is not a key the
+        engine failed to find; it is a question it correctly refused to guess at.
         """
-        return self.correct / self.expected if self.expected else None
+        return self.correct / self.evaluated if self.evaluated > 0 else None
 
     @property
     def f1(self) -> Optional[float]:
@@ -124,9 +139,10 @@ class Score:
         return "  n/a" if value is None else f"{value:.3f}"
 
     def line(self) -> str:
+        declined = f" declined={len(self.declined):3}" if self.declined else ""
         return (
             f"{self.corpus:12} expected={self.expected:3} proposed={self.proposed:3} "
-            f"correct={self.correct:3}  precision={self._fmt(self.precision)} "
+            f"correct={self.correct:3}{declined}  precision={self._fmt(self.precision)} "
             f"recall={self._fmt(self.recall)} f1={self._fmt(self.f1)}"
         )
 
@@ -175,13 +191,21 @@ def score_primary_keys(schema: PhysicalSchema, profile: Any, *, corpus: str) -> 
         if best is not None:
             proposed.add((tname.lower(), tuple(c.lower() for c in best.columns)))
     correct = truth & proposed
+    # A table the profiler declined to judge is not a table it got wrong.
+    declared = {name.lower() for name, t in schema.tables.items() if t.primary_key}
+    declined = {
+        tname.lower(): reason
+        for tname, reason in getattr(profile, "not_evaluated", {}).items()
+        if tname.lower() in declared
+    }
     return Score(
         corpus=corpus,
         expected=len(truth),
         proposed=len(proposed),
         correct=len(correct),
-        missed={t for t in truth if t not in correct},
+        missed={t for t in truth if t not in correct and t[0] not in declined},
         spurious={p for p in proposed if p not in correct},
+        declined=declined,
     )
 
 
@@ -195,4 +219,5 @@ def total(scores: Iterable[Score], *, corpus: str = "ALL") -> Score:
         correct=sum(s.correct for s in scores),
         missed=set().union(*(s.missed for s in scores)) if scores else set(),
         spurious=set().union(*(s.spurious for s in scores)) if scores else set(),
+        declined={k: v for s in scores for k, v in s.declined.items()},
     )
