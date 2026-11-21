@@ -276,6 +276,10 @@ back-links as annotation properties**, mirroring `schema_analyzer/owl_export.py`
 - physical annotations under a `phys:` namespace pointing back to source:
   - `phys:mappingStyle`, `phys:tableName`, `phys:columnName`, `phys:schemaName`
   - `phys:fromColumns`, `phys:toColumns`, `phys:joinTable`
+  - ordered keys, because RDF triples are unordered: `phys:primaryKey` (class),
+    `phys:fromColumnOrder` / `phys:toColumnOrder` (object property), each one JSON-array
+    literal, plus `phys:toTableName` — additive, so readers of the triples above are
+    unaffected
 
 Default IRIs (configurable), parallel to the Arango analyzer:
 
@@ -283,6 +287,18 @@ Default IRIs (configurable), parallel to the Arango analyzer:
 - physical annotations: `http://arangodb.com/schema/physical#`
 
 This is exactly the artifact `arango-ontoextract` consumes (TTL + provenance dict).
+
+### 5.1 OWL import (curated ontologies)
+
+`owl_import.import_owl_bundle(root_path, *, local_imports=(), phys_iri=...)` is the inverse:
+a hand-curated ontology carrying the same `phys:` annotations is read (rdflib, `owl` extra)
+into the ordinary bundle, with each element's IRI as `term`, and returned as
+`OwlImportResult(analysis, provenance)`. It parses local files only — every `owl:imports`
+must be satisfied by a supplied document — refuses RDF/XML with a DTD, never guesses a
+composite key's column order, and is deterministic, with a `canonicalGraphDigest` that is
+identical for equivalent Turtle and RDF/XML. The README's "OWL import" section has the
+full predicate table and the naming / conceptual-only rules. Entity mappings may be
+`TABLE` or `VIEW` (`phys:mappingStyle`); the baseline itself only emits `TABLE`.
 
 ---
 
@@ -295,6 +311,7 @@ from relational_schema_analyzer import (
     export_bundle,           # analysis → tool-contract JSON dict
     export_owl_turtle,       # analysis → .ttl string
     export_owl_jsonld,       # analysis → JSON-LD dict
+    import_owl_bundle,       # curated .ttl / .owl → OwlImportResult (§5.1)
 )
 
 conn = create_connector("postgresql", url, namespace="public")
@@ -305,6 +322,10 @@ analysis = analyzer.analyze(physical)              # conceptual + mapping + meta
 
 bundle = export_bundle(analysis)                   # {conceptualSchema, physicalMapping, metadata}
 ttl    = export_owl_turtle(analysis)
+
+# The inverse, for a curated ontology (§5.1):
+result = import_owl_bundle("crm.ttl", local_imports=["core.owl"])  # OwlImportResult
+bundle = result.analysis.to_bundle()               # same shape, plus `term` IRIs
 ```
 
 ### CLI (entry points mirror the Arango analyzer)

@@ -14,7 +14,11 @@ Emitted:
   ``owl:InverseFunctionalProperty``
 - ``owl:ObjectProperty`` per relationship (``rdfs:domain`` / ``rdfs:range``,
   ``owl:inverseOf``), with functional / inverse-functional from cardinality
-- ``phys:*`` annotations pointing back to the source table / column / FK / join table
+- ``phys:*`` annotations pointing back to the source table / column / FK / join table,
+  including the ordered-key annotations ``phys:primaryKey``, ``phys:fromColumnOrder`` and
+  ``phys:toColumnOrder`` (one JSON-array literal each) plus ``phys:toTableName``, so that
+  :func:`relational_schema_analyzer.owl_import.import_owl_bundle` can read the physical
+  mapping back exactly (README "Curated-ontology vocabulary" lists every predicate)
 
 Default IRIs keep the ``arangodb.com`` host (DESIGN §9.4) for ecosystem parity; both
 are overridable via the ``base_iri`` / ``phys_iri`` arguments (CLI ``--iri-base`` /
@@ -23,6 +27,7 @@ are overridable via the ``base_iri`` / ``phys_iri`` arguments (CLI ``--iri-base`
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -51,7 +56,21 @@ _PHYS_ANNOTATION_PROPERTIES = (
     "joinFromParentColumns",
     "joinToColumns",
     "joinToParentColumns",
+    "observedCardinality",
+    # Ordered-key vocabulary (read back by ``owl_import.import_owl_bundle``). RDF triples
+    # are unordered, so the repeated ``fromColumns`` / ``toColumns`` literals above cannot
+    # say which column of a composite key comes first; these carry the order as one
+    # JSON-array literal each. Additive: every triple a consumer already reads is kept.
+    "primaryKey",
+    "fromColumnOrder",
+    "toColumnOrder",
+    "toTableName",
 )
+
+
+def _json_array_literal(values: list[Any]) -> str:
+    """One JSON array of strings, compact, for the ordered ``phys:*`` annotations."""
+    return json.dumps([str(v) for v in values], ensure_ascii=False, separators=(",", ":"))
 
 
 def _as_bundle(analysis: Any) -> dict[str, Any]:
@@ -178,6 +197,10 @@ def export_owl_turtle(
                 lines.append(f'{iri} phys:tableName "{_ttl_escape(str(mapping["tableName"]))}" .')
             if mapping.get("schema"):
                 lines.append(f'{iri} phys:schemaName "{_ttl_escape(str(mapping["schema"]))}" .')
+            primary_key = mapping.get("primaryKey")
+            if isinstance(primary_key, list) and primary_key:
+                literal = _ttl_escape(_json_array_literal(primary_key))
+                lines.append(f'{iri} phys:primaryKey "{literal}" .')
         lines.append("")
 
         for prop in e.get("properties") or []:
@@ -282,6 +305,8 @@ def _object_property_lines(r: dict[str, Any], mapping: dict[str, Any] | None) ->
                 out.append(f'{iri} phys:{phys} "{_ttl_escape(str(mapping[key]))}" .')
         if mapping.get("fromTable"):
             out.append(f'{iri} phys:tableName "{_ttl_escape(str(mapping["fromTable"]))}" .')
+        if mapping.get("toTable"):
+            out.append(f'{iri} phys:toTableName "{_ttl_escape(str(mapping["toTable"]))}" .')
         if mapping.get("schema"):
             out.append(f'{iri} phys:schemaName "{_ttl_escape(str(mapping["schema"]))}" .')
         for key, phys in (
@@ -296,6 +321,11 @@ def _object_property_lines(r: dict[str, Any], mapping: dict[str, Any] | None) ->
             if isinstance(value, list):
                 for col in value:
                     out.append(f'{iri} phys:{phys} "{_ttl_escape(str(col))}" .')
+        for key, phys in (("fromColumns", "fromColumnOrder"), ("toColumns", "toColumnOrder")):
+            value = mapping.get(key)
+            if isinstance(value, list) and value:
+                literal = _ttl_escape(_json_array_literal(value))
+                out.append(f'{iri} phys:{phys} "{literal}" .')
     out.append("")
     return out
 
@@ -340,6 +370,9 @@ def export_owl_jsonld(
                 node["phys:tableName"] = str(mapping["tableName"])
             if mapping.get("schema"):
                 node["phys:schemaName"] = str(mapping["schema"])
+            primary_key = mapping.get("primaryKey")
+            if isinstance(primary_key, list) and primary_key:
+                node["phys:primaryKey"] = _json_array_literal(primary_key)
         graph.append(node)
 
         pm_props = mapping.get("properties") if isinstance(mapping, dict) else {}
@@ -399,6 +432,11 @@ def export_owl_jsonld(
                     node[f"phys:{key}"] = [str(c) for c in mapping[key]]
             if mapping.get("fromTable"):
                 node["phys:tableName"] = str(mapping["fromTable"])
+            if mapping.get("toTable"):
+                node["phys:toTableName"] = str(mapping["toTable"])
+            for key, phys in (("fromColumns", "fromColumnOrder"), ("toColumns", "toColumnOrder")):
+                if isinstance(mapping.get(key), list) and mapping[key]:
+                    node[f"phys:{phys}"] = _json_array_literal(mapping[key])
         graph.append(node)
 
     return {

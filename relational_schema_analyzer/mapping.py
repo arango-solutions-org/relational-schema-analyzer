@@ -7,14 +7,22 @@ exact table / column / FK it came from (DESIGN §3.3).
 
 Style enums diverge from the ArangoDB analyzer (the documented relational variant):
 
-    Entity:        TABLE
+    Entity:        TABLE | VIEW
     Relationship:  FOREIGN_KEY | JOIN_TABLE
 
+``VIEW`` is read from a curated ontology (``phys:mappingStyle "VIEW"``, see
+``owl_import.py``); the baseline analyzer itself emits ``TABLE`` for every entity.
+
 Entity mapping dict shape:
-    {"style": "TABLE", "tableName": str, "schema"?: str,
+    {"style": "TABLE" | "VIEW", "tableName": str, "schema"?: str,
      "primaryKey": [str],
-     "properties": {conceptualName: {"columnName": str, "sqlType": str,
+     "properties": {conceptualName: {"field": str, "sqlType": str,
                                      "nullable": bool, "unique"?: bool}}}
+
+``field`` is the column name (the contract's required back-reference). A bundle read
+from OWL carries only ``field`` and an identical ``columnName`` alias: ``sqlType`` and
+``nullable`` are not in the ontology.
+
 Relationship mapping dict shapes:
     FOREIGN_KEY: {"style": "FOREIGN_KEY", "fromTable", "fromColumns",
                   "toTable", "toColumns", "enforced"?: False, "inferred"?: True}
@@ -37,7 +45,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-EntityMappingStyle = Literal["TABLE"]
+EntityMappingStyle = Literal["TABLE", "VIEW"]
 RelationshipMappingStyle = Literal["FOREIGN_KEY", "JOIN_TABLE"]
 
 
