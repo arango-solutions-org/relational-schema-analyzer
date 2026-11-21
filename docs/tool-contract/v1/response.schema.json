@@ -112,7 +112,7 @@
                 "type": "object",
                 "required": ["style"],
                 "properties": {
-                  "style": { "type": "string", "enum": ["TABLE"] },
+                  "style": { "type": "string", "enum": ["TABLE", "VIEW"] },
                   "collectionName": { "type": "string" },
                   "tableName": { "type": "string" },
                   "schemaName": { "type": "string" },

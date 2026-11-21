@@ -156,6 +156,75 @@ subjects and are flagged). Foreign keys become referencing object maps with a fu
 properties to a relationship, so a join table's non-key attribute columns are reported in
 a comment rather than silently dropped — reify the association if you need them.
 
+**OWL import (curated ontologies).** The inverse of the OWL export. When a partner has
+curated an ontology by hand — their own concept names, each pointed at the table, column
+and foreign key that holds it — `import_owl_bundle` reads it into the same
+`{conceptualSchema, physicalMapping, metadata}` bundle the analyzer produces, so a consumer
+reconciles it against a schema snapshot exactly as it would an inferred analysis. Every
+entity, property and relationship also carries `term`, the IRI it came from. Needs the
+`owl` extra (rdflib).
+
+```python
+from relational_schema_analyzer import import_owl_bundle, OwlImportError
+
+result = import_owl_bundle("crm.ttl", local_imports=["core.owl"])
+bundle = result.analysis.to_bundle()       # metadata.source == "owl-import"
+result.provenance["canonicalGraphDigest"]  # "sha256:…", same for Turtle and RDF/XML
+```
+
+`provenance` also gives `rootOntologyIri`, `ontologyVersion` (root `owl:versionInfo`, else
+its `owl:versionIRI`, else `""`), `profileVersion` (`"1"`) and `documents`
+(`[{filename, ontologyIri, sha256}]`, root first). Turtle is read from `.ttl`, RDF/XML from
+`.owl` / `.rdf` / `.xml`. The importer treats the documents as untrusted:
+
+- **Nothing is fetched.** Each `owl:imports` must be satisfied by a supplied local document
+  whose ontology IRI or `owl:versionIRI` matches; otherwise it is an `OwlImportError` naming
+  the IRI. A supplied document the imports never reach is refused rather than merged.
+- **RDF/XML with a `DOCTYPE` / `ENTITY` declaration is refused** (no XXE, no entity bombs),
+  whatever the document's encoding.
+- **Column order is never guessed.** RDF triples are unordered, so a composite key is read
+  from a JSON-array literal; several `phys:fromColumns` values with no `phys:fromColumnOrder`
+  is an error. A single column needs no order literal.
+- **Deterministic.** The same closure gives a byte-identical bundle; a Turtle closure and its
+  RDF/XML equivalent give the same bundle and the same `canonicalGraphDigest` (blank nodes
+  canonicalized, sorted N-Triples, SHA-256).
+
+Names are the `rdfs:label` (an untagged one, else English), else the IRI's local name, and
+must be unique per kind. A class with no `phys:tableName` is conceptual only: it is in
+`conceptualSchema` and absent from `physicalMapping`; a datatype property with no named
+`rdfs:domain` is listed under `conceptualSchema.properties`. Elements that cannot be placed (an
+object property without exactly one named domain and range) are listed in
+`metadata.warnings`, or refused if they carry a physical mapping. The bundle has no
+`metadata.timestamp`: it describes documents, not an observation of a database, and must
+not change between runs.
+
+*Curated-ontology vocabulary* (`phys:` = `http://arangodb.com/schema/physical#`, overridable
+with `phys_iri=`). The Turtle export writes all of these, so export → import round-trips; each is
+declared an `owl:AnnotationProperty`. The four ordered-key predicates are additive: the
+unordered ones are still written for existing readers such as `arango-ontoextract`.
+
+| Predicate | Subject | Value | Read as |
+|---|---|---|---|
+| `phys:tableName` | `owl:Class` | literal | `tableName`; absent ⇒ conceptual only |
+| `phys:mappingStyle` | `owl:Class` | `"TABLE"` (default) or `"VIEW"` | `style` |
+| `phys:schemaName` | `owl:Class` | literal | `schema` |
+| `phys:primaryKey` | `owl:Class` | JSON array, key order: `"[\"ACCOUNT_ID\"]"` | `primaryKey` |
+| `phys:columnName` | `owl:DatatypeProperty` | literal | `properties[name].field` (and `columnName`) |
+| `phys:tableName` | `owl:DatatypeProperty` | literal | which domain class's table the column is in |
+| `phys:mappingStyle` | `owl:ObjectProperty` | `"FOREIGN_KEY"` (default) or `"JOIN_TABLE"` | `style` |
+| `phys:tableName` | `owl:ObjectProperty` | literal | `fromTable`; default: the domain class's table |
+| `phys:toTableName` | `owl:ObjectProperty` | literal | `toTable`; default: the range class's table |
+| `phys:fromColumnOrder` / `phys:toColumnOrder` | `owl:ObjectProperty` | JSON array, in order | `fromColumns` / `toColumns` |
+| `phys:fromColumns` / `phys:toColumns` | `owl:ObjectProperty` | one literal per column (unordered) | used alone only for a single column |
+| `phys:schemaName` | `owl:ObjectProperty` | literal | `schema` |
+| `phys:observedCardinality` | `owl:ObjectProperty` | `"1:1"`, `"1:N"`, `"N:1"`, `"N:M"` | conceptual `cardinality` |
+| `phys:joinTable` | `owl:ObjectProperty` | literal | `joinTable` (JOIN_TABLE) |
+| `phys:joinFromColumns`, `phys:joinFromParentColumns`, `phys:joinToColumns`, `phys:joinToParentColumns` | `owl:ObjectProperty` | one literal per column | the same keys (JOIN_TABLE; single column only) |
+
+Conceptual properties take `type` from `rdfs:range` (XSD integer types → `integer`,
+`xsd:decimal` / `double` / `float` → `float`, `xsd:boolean` → `boolean`, anything else →
+`string`) and `unique` from `owl:FunctionalProperty` + `owl:InverseFunctionalProperty`.
+
 Sources: `postgresql`, `mysql`, `sqlserver`, `snowflake`, `duckdb`, `sqlite`, `databricks`, `csv`,
 plus two **data-catalog** sources (see `docs/DESIGN.md` §9.3.1): `dbt` (a dbt
 `manifest.json` — tests/contracts → constraints + FKs) and `osi` (an Open Semantic

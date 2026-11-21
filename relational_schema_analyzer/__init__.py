@@ -58,6 +58,7 @@ from .overlay import (
 )
 from .providers import list_providers, register_provider
 from .owl_export import export_owl_jsonld, export_owl_turtle
+from .owl_import import OwlImportError, OwlImportResult, import_owl_bundle
 from .r2rml_export import (
     DEFAULT_R2RML_DATA_IRI,
     DEFAULT_R2RML_MAPPING_IRI,
@@ -129,6 +130,10 @@ __all__ = [
     "export_owl_turtle",
     "export_owl_jsonld",
     "export_r2rml_turtle",
+    # OWL import: a curated ontology with phys: back-links -> the same bundle shape
+    "import_owl_bundle",
+    "OwlImportResult",
+    "OwlImportError",
     "DEFAULT_R2RML_DATA_IRI",
     "DEFAULT_R2RML_MAPPING_IRI",
     # Phase 5 — tool contract / MCP
