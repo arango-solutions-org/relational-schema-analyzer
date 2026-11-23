@@ -9,7 +9,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "relational-schema-analyzer"
-version = "0.12.0"
+version = "0.13.0"
 description = "Analyze a relational database schema into a conceptual model (OWL-capable) with mapping back to the source schema."
 readme = "README.md"
 requires-python = ">=3.10"

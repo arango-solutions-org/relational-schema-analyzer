@@ -15,7 +15,7 @@ from __future__ import annotations
 
 # Defined before the submodule imports below because ``analyzer``/``metadata``
 # read ``relational_schema_analyzer.__version__`` at import time.
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
 from .analyzer import Analysis, RelationalSchemaAnalyzer
 from .bitemporal import (

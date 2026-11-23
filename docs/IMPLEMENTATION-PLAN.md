@@ -726,13 +726,62 @@ projection — the whole core (Phases 0–5) landed together in the first releas
     opened (#44); embedded engines hash the library version into the schema fingerprint
     (#45).
 
+- **v0.13.0** — **fixes and cleanup from the first `/code-quality` audit, and two contract
+  decisions.** A minor version because output changes for some callers; each change is
+  listed below.
+  - *Output changes.*
+    - **Empty samples.** A reference column whose sampled values are all NULL is "not
+      evaluated" on Postgres, DuckDB and SQLite, as it already was elsewhere. It used to
+      score 0.0, the hard veto, and delete a correct foreign key (#52, PR #61).
+    - **JSON-LD.** It now carries the join tables' parent columns and the relationships'
+      `schemaName`. Turtle and JSON-LD are rendered from one model, so a fact can no
+      longer be in one and missing from the other (#53, PR #64).
+    - **Self-references.** A primary key that references its own table is no longer
+      reported as inheritance (`Acct subClassOf Acct`) (#54, PR #65).
+    - **One stamping rule.** The CLI and `run_tool` share `pipeline.load_physical`. A
+      snapshot that already carries a stamp keeps it unless a prior run is given; the CLI
+      used to re-stamp it with the time the file was re-read (#60, PR #72).
+    - **A sampler turns sampling on.** `InferenceOptions.sample_overlap` defaults to
+      `None`, meaning "sample when a sampler is passed". Before, a sampler passed on its
+      own was ignored. An explicit `False` still turns it off, and every known caller sets
+      the flag, so they are unaffected (#60, PR #72).
+  - *Fixes with no output change for ordinary schemas.*
+    - **MCP stdout.** The stdio MCP server keeps log lines off stdout, which is its
+      protocol channel (PR #51).
+    - **Postgres key order.** Composite primary keys are read in declared column order
+      (#55, PR #66).
+    - **Quotes in names.** A `"` inside a table or column name no longer breaks Postgres
+      and Snowflake bulk reads or Snowflake's key statements (#55, PR #66).
+    - **Discriminator and specialization probes.** They quote and cap rows per dialect:
+      backticks for MySQL and Databricks, brackets and `TOP` for SQL Server. Before,
+      every probe failed on MySQL, and SQL Server fell back to reading a whole column
+      (#56, PR #67).
+    - **Specialization counter.** It reads a bounded parent sample, as documented
+      (#56, PR #67).
+    - **MySQL and SQL Server samplers.** They skip the second query on an empty sample,
+      and keep the strict score when the normalized query fails (#59, PR #69).
+  - *Cleanup, verified output-identical.*
+    - **Connectors.** One table builder and key marker are shared by every connector
+      (#58, PR #68).
+    - **Samplers.** Connection plumbing is shared, and MySQL and Databricks share one set
+      of SQL (#59, PR #69).
+    - **Dead code removed:** `heuristics.py`, `DumpReader.read_chunks`,
+      `postgres.preview_table_rows`. r2g keeps its own copies.
+    - **Written once:** `quoting.py` holds the three identifier-quoting rules, and key
+      profiling's two passes share one loop (#60, PR #70).
+    - **Log events renamed:** `mysql_sampler_*`, `sqlserver_sampler_*`, and
+      `csv_sampler_read_failed`.
+  - *Cross-repo.* arango-schema-analyzer needs the new `sample_overlap` default ported
+    (arango-schema-analyzer#75). Overlay in the tool contract waits on its agreement (#71).
+
 Planned next:
 
 - **mcp 2.0 port** — the `[mcp]` extra is pinned `<2` because mcp 2.0 removed the bundled
   `mcp.server.fastmcp` in favour of a new `MCPServer` API (FastMCP moved to its own package).
   `mcp_server.py` targets the 1.x FastMCP API. Porting it is a contained piece of work; until
   then the pin is what keeps the extra installable.
-- **v0.13.0 (target; was v0.12.0 until the SQLite release took that one, v0.10.0 and v0.11.0
+- **v0.14.0 (target; was v0.13.0 until the audit-fix release took that one, v0.12.0 until the
+  SQLite release took that one, v0.10.0 and v0.11.0
   until the singularizer releases took those numbers, v0.9.0 until key discovery took that one, and v0.8.0 before bitemporal stamping
   took that one)** — the
   **BigQuery** connector with its cost governor (see
