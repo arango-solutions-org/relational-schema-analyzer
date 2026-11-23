@@ -161,7 +161,11 @@ class InferenceOptions:
     )
     max_candidates_per_column: int = 3
     allow_composite: bool = True
-    sample_overlap: bool = False
+    #: ``None`` (the default) samples whenever a sampler is passed. It used to default to
+    #: ``False``, so a sampler passed on its own was silently ignored, and every caller had
+    #: to write ``sample_overlap=sampler is not None`` (#60). ``False`` still turns
+    #: sampling off with a sampler present; ``True`` changes nothing without one.
+    sample_overlap: Optional[bool] = None
     overlap_veto_on_zero: bool = True
 
 
@@ -304,6 +308,9 @@ def infer_foreign_keys(
     (one entry per ``(table, tuple(columns), foreign_table)`` triple),
     sorted by confidence descending, and filtered by
     ``options.min_confidence``.
+
+    A ``sampler`` adjusts confidence by value overlap (and vetoes a zero overlap)
+    unless ``options.sample_overlap`` is ``False``.
     """
     opts = options or InferenceOptions()
 
@@ -338,7 +345,7 @@ def infer_foreign_keys(
 
     # Sampler pass: adjust confidence on every candidate we still have.
     all_candidates = single + composite
-    if sampler is not None and opts.sample_overlap:
+    if sampler is not None and opts.sample_overlap is not False:
         sampled = [_apply_sampler(c, sampler, opts) for c in all_candidates]
         all_candidates = [c for c in sampled if c is not None]
 
@@ -888,8 +895,7 @@ class PostgresValueSampler:
     Usage::
 
         sampler = PostgresValueSampler(conn_str, schema_name="public", limit=10_000)
-        infer_foreign_keys(schema, options=InferenceOptions(sample_overlap=True),
-                           sampler=sampler)
+        infer_foreign_keys(schema, sampler=sampler)
 
     The sampler is resilient: any exception from psycopg gets caught
     and surfaced as ``None`` so the name-based score still wins. Call

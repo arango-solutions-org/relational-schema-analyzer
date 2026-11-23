@@ -54,9 +54,9 @@ from __future__ import annotations
 from typing import Any
 
 from .analyzer import RelationalSchemaAnalyzer
-from .bitemporal import PriorRun, stamp_bitemporal
-from .connectors import create_connector
+from .bitemporal import PriorRun
 from .owl_export import export_owl_jsonld, export_owl_turtle
+from .pipeline import load_physical
 from .r2rml_export import export_r2rml_turtle
 from .types import PhysicalSchema
 
@@ -86,8 +86,8 @@ def _error(request: Any, code: str, message: str) -> dict[str, Any]:
 def _load_physical(request: dict[str, Any]) -> PhysicalSchema:
     """Introspect a live source, or load a previously captured PhysicalSchema.
 
-    Bitemporal stamping is applied to either path, so a contract caller records valid time
-    exactly as the CLI does. It runs last because ``input.priorRun`` gates the result.
+    Runs the pipeline the CLI runs too (``pipeline.py``), so a contract caller gets the
+    same bitemporal stamp as a CLI caller. ``input.previousAnalysis`` gates it.
     """
     given = request.get("input") or {}
     previous = given.get("previousAnalysis") if isinstance(given, dict) else None
@@ -95,23 +95,18 @@ def _load_physical(request: dict[str, Any]) -> PhysicalSchema:
 
     if isinstance(given, dict) and given.get("physical") is not None:
         captured = PhysicalSchema.model_validate(given["physical"])
-        # A captured schema may already carry a stamp from the run that produced it.
-        # Re-stamping would overwrite that observation time with this one, dating the
-        # schema to when it was re-read rather than when the source was seen.
-        if captured.transaction_time and prior is None:
-            return captured
-        return stamp_bitemporal(captured, prior=prior)
+        return load_physical(captured=captured, prior=prior)
 
     source = request.get("source")
     if not isinstance(source, dict) or not source.get("type") or not source.get("url"):
         raise ValueError("request needs 'input.physical' or 'source' with 'type' and 'url'")
-    connector = create_connector(
-        source["type"],
-        source["url"],
+    return load_physical(
+        source_type=source["type"],
+        url=source["url"],
         schema_name=source.get("schema", "public"),
         source_params=source.get("params"),
+        prior=prior,
     )
-    return stamp_bitemporal(connector.get_schema(), prior=prior)
 
 
 def run_tool(request: dict[str, Any]) -> dict[str, Any]:
