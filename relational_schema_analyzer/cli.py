@@ -23,7 +23,7 @@ from typing import Any
 
 from . import __version__
 from .analyzer import RelationalSchemaAnalyzer
-from .connectors import SUPPORTED_SOURCE_TYPES, create_connector
+from .connectors import SUPPORTED_SOURCE_TYPES
 from .r2rml_export import (
     DEFAULT_R2RML_DATA_IRI,
     DEFAULT_R2RML_MAPPING_IRI,
@@ -35,9 +35,10 @@ from .owl_export import (
     export_owl_jsonld,
     export_owl_turtle,
 )
-from .bitemporal import PriorRun, stamp_bitemporal
+from .bitemporal import PriorRun
 from .log import keep_logs_off_stdout
-from .overlay import OverlayError, apply_key_overlay, load_key_overlay
+from .overlay import OverlayError, load_key_overlay
+from .pipeline import load_physical
 from .types import PhysicalSchema
 
 
@@ -90,20 +91,32 @@ def _add_output_args(p: argparse.ArgumentParser) -> None:
 
 
 def _load_physical(args: argparse.Namespace) -> PhysicalSchema:
-    physical = _introspect(args)
-    # Applied last, and identically for live and captured schemas: an overlay describes the
-    # *schema*, not how it was obtained, so `snapshot --overlay` and
-    # `analyze --from-snapshot --overlay` must agree.
+    """Check the arguments, then run the pipeline ``run_tool`` runs too (``pipeline.py``)."""
+    if not args.from_snapshot and not (args.source and args.url):
+        raise SystemExit(
+            "error: provide either --from-snapshot FILE or both --source and --url"
+        )
+    overlay = None
     if getattr(args, "overlay", None):
         try:
-            physical = apply_key_overlay(physical, load_key_overlay(args.overlay))
+            overlay = load_key_overlay(args.overlay)
         except OverlayError as err:
             raise SystemExit(f"error: {err}") from err
-    # Bitemporal stamping runs last and unconditionally: RSA is the only component that can
-    # observe valid time (DESIGN-ADDENDUM-bitemporal), so an unstamped emission throws away
-    # information nothing downstream can recover. It runs after the overlay because an
-    # overlay changes the structure, and therefore the fingerprint the §2.3 rule compares.
-    return stamp_bitemporal(physical, prior=_load_prior_run(args))
+    prior = _load_prior_run(args)
+    try:
+        return load_physical(
+            captured=(
+                PhysicalSchema.load_from_file(args.from_snapshot) if args.from_snapshot else None
+            ),
+            source_type=args.source,
+            url=args.url,
+            schema_name=args.schema,
+            source_params={"delimiter": args.delimiter, "has_header": not args.no_header},
+            overlay=overlay,
+            prior=prior,
+        )
+    except OverlayError as err:
+        raise SystemExit(f"error: {err}") from err
 
 
 def _load_prior_run(args: argparse.Namespace) -> "PriorRun | None":
@@ -129,20 +142,6 @@ def _load_prior_run(args: argparse.Namespace) -> "PriorRun | None":
             "pass a previous bundle or its metadata block"
         )
     return prior
-
-
-def _introspect(args: argparse.Namespace) -> PhysicalSchema:
-    if args.from_snapshot:
-        return PhysicalSchema.load_from_file(args.from_snapshot)
-    if not args.source or not args.url:
-        raise SystemExit(
-            "error: provide either --from-snapshot FILE or both --source and --url"
-        )
-    source_params = {"delimiter": args.delimiter, "has_header": not args.no_header}
-    connector = create_connector(
-        args.source, args.url, schema_name=args.schema, source_params=source_params
-    )
-    return connector.get_schema()
 
 
 def _emit(payload: str, out: str | None) -> None:

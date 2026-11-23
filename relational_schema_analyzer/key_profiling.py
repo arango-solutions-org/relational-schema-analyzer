@@ -496,7 +496,7 @@ def draft_key_overlay(
     3. The draft is applied to a copy of ``schema`` before it is returned, so a
        draft that would not load is a bug here, never a surprise for the reviewer.
     """
-    from .fk_inference import InferenceOptions, infer_foreign_keys
+    from .fk_inference import infer_foreign_keys
     from .overlay import SUPPORTED_OVERLAY_VERSION, apply_key_overlay
 
     profile = profile_primary_keys(schema, probe, tables=tables, max_pair_checks=max_pair_checks)
@@ -565,8 +565,7 @@ def draft_key_overlay(
             },
         },
     )
-    options = InferenceOptions(sample_overlap=sampler is not None)
-    for fk in infer_foreign_keys(keyed, options=options, sampler=sampler):
+    for fk in infer_foreign_keys(keyed, sampler=sampler):
         if fk.confidence < min_fk_confidence:
             continue
         table = keyed.tables[fk.table]

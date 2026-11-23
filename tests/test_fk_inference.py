@@ -551,6 +551,24 @@ class TestSamplerIntegration:
         )
         assert len(out) == 1
 
+    def test_a_sampler_on_its_own_is_used(self):
+        # It used to be ignored unless sample_overlap=True was also passed (#60), so a
+        # caller handing over a sampler got name-only scores and no sign of why.
+        out = infer_foreign_keys(self._schema(), sampler=lambda *args: 0.0)
+        assert out == []  # the zero overlap vetoed the only candidate
+
+    def test_sample_overlap_false_still_turns_a_sampler_off(self):
+        s = self._schema()
+        out = infer_foreign_keys(
+            s, options=InferenceOptions(sample_overlap=False), sampler=lambda *args: 0.0
+        )
+        assert [c.confidence for c in out] == [c.confidence for c in infer_foreign_keys(s)]
+
+    def test_sample_overlap_without_a_sampler_changes_nothing(self):
+        s = self._schema()
+        out = infer_foreign_keys(s, options=InferenceOptions(sample_overlap=True))
+        assert out == infer_foreign_keys(s)
+
     def test_sampler_none_is_neutral(self):
         s = self._schema()
         out_no = infer_foreign_keys(s)
