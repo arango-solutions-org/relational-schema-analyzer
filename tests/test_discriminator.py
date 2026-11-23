@@ -271,6 +271,17 @@ def test_no_specialization_without_a_discriminator():
     assert specialization_parents(schema, detect_discriminators(schema)) == {}
 
 
+def test_a_parent_referencing_itself_is_not_its_own_subtype():
+    """Its own key pointing at itself made ``account`` a child of ``account`` (#54)."""
+    parent = accounts_table()
+    parent.foreign_keys = [
+        ForeignKey(columns=["account_id"], foreign_table="account", foreign_columns=["account_id"])
+    ]
+    schema = schema_of(parent, subtype_table("mortgage_account", [col("principal", "numeric")]))
+    parents = specialization_parents(schema, detect_discriminators(schema))
+    assert parents == {"account": ["mortgage_account"]}
+
+
 def test_ordinary_foreign_key_is_not_a_subtype():
     """The PK must *be* the FK — a plain reference to a discriminated table is not."""
     child = Table(

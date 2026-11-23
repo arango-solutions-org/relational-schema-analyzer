@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .discriminator import is_shared_pk_fk
 from .fk_inference import infer_foreign_keys
 from .naming import convert_identifier
 from .overlay import overlay_applied, overlay_summary
@@ -116,15 +117,6 @@ def _cardinality_for_fk(fk: ForeignKey, local: Table) -> str:
     if local.primary_key and set(fk.columns) == set(local.primary_key):
         return "1:1"
     return "1:N"
-
-
-def _is_shared_pk_fk(fk: ForeignKey, local: Table) -> bool:
-    """True when the table's single-column PK is itself this FK (inheritance hint)."""
-    return (
-        len(local.primary_key) == 1
-        and len(fk.columns) == 1
-        and fk.columns[0] == local.primary_key[0]
-    )
 
 
 def _unique_rel_type(base: str, fk_columns: list[str], used: set[str]) -> str:
@@ -321,7 +313,7 @@ def infer_baseline(schema: PhysicalSchema) -> dict[str, Any]:
                 pm_rel["enforced"] = False
             pm_relationships[rel_type] = pm_rel
 
-            if _is_shared_pk_fk(fk, table):
+            if is_shared_pk_fk(table_name, table, fk):
                 _add_pattern("inheritance_via_shared_pk")
                 review_required = True
                 entity = next(e for e in entities if e["name"] == from_entity)

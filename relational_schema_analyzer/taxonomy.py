@@ -23,6 +23,7 @@ from typing import Any, Optional
 from .discriminator import (
     DiscriminatorCandidate,
     detect_discriminators,
+    shared_pk_children,  # re-exported: AOE imports it from here
     specialization_parents,
 )
 from .types import Schema
@@ -46,26 +47,6 @@ except ImportError:  # pragma: no cover - exercised via the degradation test
 #: sources. Returning ``None`` means "not evaluated", which yields ``null`` constraints
 #: rather than a guess.
 SpecializationCounter = Callable[[str, str, list[str]], Optional[dict[str, int]]]
-
-
-def shared_pk_children(schema: Schema) -> dict[str, list[str]]:
-    """``{parent table: [child tables]}`` for class-table inheritance.
-
-    A child whose single-column primary key is also a foreign key to the parent. This is the
-    signal ``baseline._is_shared_pk_fk`` already detects; collecting it here lets the shared
-    library arbitrate between it and concept analysis instead of two channels writing
-    competing parents for the same entity.
-    """
-    parents: dict[str, list[str]] = {}
-    for table_name in sorted(schema.tables):
-        table = schema.tables[table_name]
-        if len(table.primary_key) != 1:
-            continue
-        pk = table.primary_key[0]
-        for fk in table.foreign_keys:
-            if list(fk.columns) == [pk] and fk.foreign_table != table_name:
-                parents.setdefault(fk.foreign_table, []).append(table_name)
-    return {p: sorted(set(c)) for p, c in parents.items()}
 
 
 def build_inputs(

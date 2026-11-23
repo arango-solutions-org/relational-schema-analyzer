@@ -106,6 +106,19 @@ class TestForeignKeys:
         )
         assert profile["subClassOf"] == "Users"
 
+    def test_a_key_referencing_its_own_table_is_not_inheritance(self):
+        """``acct.id -> acct.id`` is a self-reference, not a superclass (#54)."""
+        acct = Table(
+            name="acct",
+            columns=[_col("id", pk=True)],
+            primary_key=["id"],
+            foreign_keys=[ForeignKey(column="id", foreign_table="acct", foreign_column="id")],
+        )
+        result = infer_baseline(_schema(acct))
+        (entity,) = result["conceptualSchema"]["entities"]
+        assert "subClassOf" not in entity, "an entity cannot be its own superclass"
+        assert "inheritance_via_shared_pk" not in result["detectedPatterns"]
+
     def test_two_fks_between_same_entities_get_distinct_types(self):
         users = Table(name="users", columns=[_col("id", pk=True)], primary_key=["id"])
         messages = Table(

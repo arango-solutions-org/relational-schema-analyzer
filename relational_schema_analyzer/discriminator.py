@@ -6,7 +6,7 @@ One detector closes two gaps at once (see ``docs/DESIGN-ADDENDUM-taxonomy.md`` �
   whole taxonomy encoded in that column's values.
 * **the discriminator half of specialization** — a supertype table that carries the common
   columns *and* a type column, alongside subtype tables joined on shared PK. RSA already
-  detects the shared-PK edges (``_is_shared_pk_fk``); without the discriminator it emits four
+  detects the shared-PK edges (:func:`is_shared_pk_fk`); without the discriminator it emits four
   independent ``subClassOf`` assertions rather than one closed specialization.
 
 Two sources, and the first is strictly better:
@@ -30,7 +30,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
-from .types import Schema, Table
+from .types import ForeignKey, Schema, Table
 
 DiscriminatorSource = Literal["check_constraint", "sampled"]
 
@@ -207,6 +207,37 @@ def detect_discriminators(
     return sorted(found, key=lambda c: (-c.confidence, c.table, c.column))
 
 
+def is_shared_pk_fk(table_name: str, table: Table, fk: ForeignKey) -> bool:
+    """True when ``fk`` makes ``table`` a subtype: its single-column primary key *is* the FK.
+
+    The one definition of class-table inheritance, used by the baseline, the shared-PK walk
+    and specialization detection. A key that references its own table is excluded: that is
+    a self-reference, and reading it as inheritance made an entity its own superclass (#54).
+    """
+    return (
+        len(table.primary_key) == 1
+        and list(fk.columns) == table.primary_key
+        and fk.foreign_table != table_name
+    )
+
+
+def shared_pk_children(schema: Schema) -> dict[str, list[str]]:
+    """``{parent table: [child tables]}`` for class-table inheritance.
+
+    A child whose single-column primary key is also a foreign key to the parent
+    (:func:`is_shared_pk_fk`). Collecting it here lets the shared library arbitrate between
+    it and concept analysis instead of two channels writing competing parents for the same
+    entity.
+    """
+    parents: dict[str, list[str]] = {}
+    for table_name in sorted(schema.tables):
+        table = schema.tables[table_name]
+        for fk in table.foreign_keys:
+            if is_shared_pk_fk(table_name, table, fk):
+                parents.setdefault(fk.foreign_table, []).append(table_name)
+    return {p: sorted(set(c)) for p, c in parents.items()}
+
+
 def specialization_parents(
     schema: Schema, candidates: list[DiscriminatorCandidate]
 ) -> dict[str, list[str]]:
@@ -218,15 +249,4 @@ def specialization_parents(
     decision belongs there (see the addendum §2, item 2).
     """
     discriminated = {c.table for c in candidates}
-    parents: dict[str, list[str]] = {}
-
-    for table_name in sorted(schema.tables):
-        table = schema.tables[table_name]
-        if len(table.primary_key) != 1:
-            continue
-        pk = table.primary_key[0]
-        for fk in table.foreign_keys:
-            if list(fk.columns) == [pk] and fk.foreign_table in discriminated:
-                parents.setdefault(fk.foreign_table, []).append(table_name)
-
-    return {parent: sorted(children) for parent, children in parents.items() if children}
+    return {p: c for p, c in shared_pk_children(schema).items() if p in discriminated}
