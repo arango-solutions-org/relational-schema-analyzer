@@ -14,7 +14,10 @@ always ``null``. Both are implemented here against the DB-API cursor every conne
 already exposes, so they work on any source whose driver speaks it.
 
 SQL is kept to the intersection of the dialects RSA supports — no window functions, no
-lateral joins, no ``FILTER``. Identifiers are quoted, never interpolated raw.
+lateral joins, no ``FILTER``. Identifiers are quoted, never interpolated raw. The two things
+that do differ by dialect come from ``source_type``: how an identifier is quoted (MySQL
+rejects ``"t"`` without ``ANSI_QUOTES``) and how a row cap is spelled (SQL Server has no
+``LIMIT``). Every query reads a bounded number of rows (#56).
 """
 
 from __future__ import annotations
@@ -23,24 +26,48 @@ import logging
 from collections.abc import Callable
 from typing import Any, Optional
 
+from .connectors.base import normalize_source_type, quote_identifier
+from .connectors.mssql import _quote_ident as _bracket_quote
+from .connectors.mysql import _quote_ident as _backtick_quote
+
 logger = logging.getLogger(__name__)
 
 #: Anything exposing DB-API ``cursor()``, or a callable returning rows for a SQL string.
 Executor = Callable[[str, tuple[Any, ...]], Optional[list[tuple[Any, ...]]]]
 
 
-def _quote(identifier: str, *, schema: str | None = None) -> str:
-    """Double-quote an identifier, escaping embedded quotes.
+#: Default number of rows a probe reads, as for the value samplers.
+DEFAULT_ROW_LIMIT = 10_000
 
-    Table and column names cannot travel as bind parameters, so this is the guard. Doubling
-    an embedded quote is the SQL standard escape and is accepted by every dialect here.
-    """
-    if not isinstance(identifier, str) or not identifier:
-        raise ValueError("identifier must be a non-empty string")
-    quoted = '"' + identifier.replace('"', '""') + '"'
-    if schema:
-        return '"' + schema.replace('"', '""') + '".' + quoted
-    return quoted
+
+class _Dialect:
+    """How one source quotes identifiers and caps rows."""
+
+    def __init__(self, source_type: str | None) -> None:
+        key = normalize_source_type(source_type) if source_type else None
+        self.quote_rule: Callable[[str], str] = {
+            "mysql": _backtick_quote,
+            "databricks": _backtick_quote,
+            "sqlserver": _bracket_quote,
+        }.get(key or "", quote_identifier)  # ANSI double quotes: Postgres, Snowflake, DuckDB, SQLite
+        self.top = key == "sqlserver"  # SELECT TOP (n), not LIMIT n
+
+    def quote(self, identifier: str, *, schema: str | None = None) -> str:
+        """Quote an identifier with this dialect's rule, escaping it.
+
+        Table and column names cannot travel as bind parameters, so this is the guard.
+        """
+        if not isinstance(identifier, str) or not identifier:
+            raise ValueError("identifier must be a non-empty string")
+        quoted = self.quote_rule(identifier)
+        return f"{self.quote_rule(schema)}.{quoted}" if schema else quoted
+
+    def select(self, columns: str, rest: str, limit: int, *, distinct: bool = False) -> str:
+        """``SELECT [DISTINCT] columns rest``, returning at most ``limit`` rows."""
+        d, n = ("DISTINCT " if distinct else ""), int(limit)
+        if self.top:
+            return f"SELECT {d}TOP ({n}) {columns} {rest}"
+        return f"SELECT {d}{columns} {rest} LIMIT {n}"
 
 
 def executor_from_connection(connection: Any) -> Executor:
@@ -66,24 +93,25 @@ def executor_from_connection(connection: Any) -> Executor:
 
 
 def make_value_enumerator(
-    executor: Executor, *, schema: str | None = None
+    executor: Executor, *, schema: str | None = None, source_type: str | None = None
 ) -> Callable[[str, str, int], list[str] | None]:
     """Distinct values of a column, for ``discriminator.detect_discriminators``.
 
     Bounded by ``limit + 1`` so a high-cardinality column is rejected on cardinality without
-    reading it — the detector's own gate then drops anything above ``max_distinct``.
+    reading it — the detector's own gate then drops anything above ``max_distinct``. A failed
+    query is "unmeasured": there is no unbounded retry.
     """
+    dialect = _Dialect(source_type)
 
     def enumerate_values(table: str, column: str, limit: int) -> list[str] | None:
-        sql = (
-            f"SELECT DISTINCT {_quote(column)} FROM {_quote(table, schema=schema)} "
-            f"WHERE {_quote(column)} IS NOT NULL"
+        col = dialect.quote(column)
+        sql = dialect.select(
+            col,
+            f"FROM {dialect.quote(table, schema=schema)} WHERE {col} IS NOT NULL",
+            int(limit) + 1,
+            distinct=True,
         )
-        rows = executor(f"{sql} LIMIT {int(limit) + 1}", ())
-        if rows is None:
-            # Not every dialect spells the row cap the same way; fall back to an unbounded
-            # DISTINCT, which is still bounded in practice by the column's cardinality.
-            rows = executor(sql, ())
+        rows = executor(sql, ())
         if rows is None:
             return None
         return [str(r[0]) for r in rows if r and r[0] is not None]
@@ -92,7 +120,11 @@ def make_value_enumerator(
 
 
 def make_specialization_counter(
-    executor: Executor, *, schema: str | None = None
+    executor: Executor,
+    *,
+    schema: str | None = None,
+    source_type: str | None = None,
+    limit: int = DEFAULT_ROW_LIMIT,
 ) -> Callable[[str, str, list[str]], dict[str, int] | None]:
     """Parent-key membership across subtype tables, for the ER specialization constraints.
 
@@ -102,17 +134,18 @@ def make_specialization_counter(
     ``null`` — which is correct but uninformative.
 
     One query, using scalar subqueries rather than joins so the row count cannot be inflated
-    by a subtype with duplicate keys.
+    by a subtype with duplicate keys. At most ``limit`` parent rows are sampled.
     """
+    dialect = _Dialect(source_type)
 
     def count(parent: str, pk: str, children: list[str]) -> dict[str, int] | None:
         if not children:
             return None
-        parent_ref = _quote(parent, schema=schema)
-        pk_ref = _quote(pk)
+        pk_ref = dialect.quote(pk)
+        sample = dialect.select(pk_ref, f"FROM {dialect.quote(parent, schema=schema)}", limit)
         memberships = " + ".join(
             "(SELECT COUNT(*) FROM {child} c WHERE c.{pk} = p.{pk})".format(
-                child=_quote(child, schema=schema), pk=pk_ref
+                child=dialect.quote(child, schema=schema), pk=pk_ref
             )
             for child in children
         )
@@ -120,7 +153,7 @@ def make_specialization_counter(
             "SELECT COUNT(*) AS total, "
             "SUM(CASE WHEN n > 1 THEN 1 ELSE 0 END) AS in_multiple, "
             "SUM(CASE WHEN n = 0 THEN 1 ELSE 0 END) AS in_none FROM ("
-            f"SELECT ({memberships}) AS n FROM {parent_ref} p"
+            f"SELECT ({memberships}) AS n FROM ({sample}) p"
             ") s"
         )
         rows = executor(sql, ())
