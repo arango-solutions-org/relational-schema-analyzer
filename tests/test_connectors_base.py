@@ -168,3 +168,12 @@ class TestProtocolConformance:
 
         conn = CsvConnector("/tmp/dumps")
         assert isinstance(conn, SourceConnector)
+
+
+def test_quote_identifier_doubles_an_embedded_quote():
+    """Wrapping without doubling broke any name containing ``"`` (#55)."""
+    from relational_schema_analyzer.connectors.base import quote_identifier
+
+    assert quote_identifier("orders") == '"orders"'
+    assert quote_identifier('we"ird') == '"we""ird"'
+    assert quote_identifier("") == '""'

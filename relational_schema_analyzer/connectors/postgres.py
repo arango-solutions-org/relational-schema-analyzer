@@ -34,6 +34,7 @@ from ..bitemporal import to_iso as _iso
 from ..check_enum import enrich_check_constraint
 from ..log import get_logger
 from ..types import CheckConstraint, Column, ForeignKey, Schema, SourceProvenance, Table
+from .base import quote_identifier
 
 logger = get_logger(__name__)
 
@@ -345,7 +346,8 @@ class PostgresConnector:
               AND tc.table_schema = kcu.table_schema
             WHERE tc.constraint_type = 'PRIMARY KEY'
               AND tc.table_schema = %s
-              AND tc.table_name = %s;
+              AND tc.table_name = %s
+            ORDER BY kcu.ordinal_position;
             """,
             (self.schema_name, table_name),
         )
@@ -600,13 +602,13 @@ class PostgresSession:
         since_column: Optional[str] = None,
         since_value: Optional[str] = None,
     ) -> int:
-        qualified = f'"{self.schema_name}"."{table}"'
+        qualified = f"{quote_identifier(self.schema_name)}.{quote_identifier(table)}"
         conn = self.connection
         with conn.cursor(row_factory=tuple_row) as cur:
             if since_column and since_value is not None:
                 cur.execute(
                     f'SELECT count(*) FROM {qualified} '  # noqa: S608
-                    f'WHERE "{since_column}" >= %s',
+                    f"WHERE {quote_identifier(since_column)} >= %s",
                     (since_value,),
                 )
             else:
@@ -622,7 +624,7 @@ class PostgresSession:
         since_column: Optional[str] = None,
         since_value: Optional[str] = None,
     ) -> Iterator[dict[str, Any]]:
-        qualified = f'"{self.schema_name}"."{table}"'
+        qualified = f"{quote_identifier(self.schema_name)}.{quote_identifier(table)}"
         cursor_name = f"r2g_{table}"
         conn = self.connection
         with conn.cursor(name=cursor_name, row_factory=dict_row) as cur:
@@ -630,7 +632,7 @@ class PostgresSession:
             if since_column and since_value is not None:
                 cur.execute(
                     f'SELECT * FROM {qualified} '  # noqa: S608
-                    f'WHERE "{since_column}" >= %s',
+                    f"WHERE {quote_identifier(since_column)} >= %s",
                     (since_value,),
                 )
             else:
@@ -650,7 +652,7 @@ class PostgresSession:
         fetching. Returns the number of data rows written (i.e.
         excluding the header).
         """
-        qualified = f'"{self.schema_name}"."{table}"'
+        qualified = f"{quote_identifier(self.schema_name)}.{quote_identifier(table)}"
         header_clause = "CSV HEADER" if header else "CSV"
         copy_sql = f"COPY {qualified} TO STDOUT WITH {header_clause}"  # noqa: S608
         out_path = Path(out_path)
