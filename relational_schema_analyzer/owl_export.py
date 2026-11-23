@@ -27,6 +27,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from .exports import export_bundle
+
 DEFAULT_OWL_BASE_IRI = "http://arangodb.com/schema/relational#"
 DEFAULT_OWL_PHYSICAL_IRI = "http://arangodb.com/schema/physical#"
 
@@ -53,15 +55,6 @@ _PHYS_ANNOTATION_PROPERTIES = (
     "joinToColumns",
     "joinToParentColumns",
 )
-
-
-def _as_bundle(analysis: Any) -> dict[str, Any]:
-    """Accept an ``Analysis`` (with ``to_bundle()``) or a bundle dict."""
-    if hasattr(analysis, "to_bundle"):
-        return analysis.to_bundle()
-    if isinstance(analysis, dict):
-        return analysis
-    raise TypeError("expected an Analysis or a bundle dict")
 
 
 def _ttl_escape(s: str) -> str:
@@ -317,7 +310,7 @@ def export_owl_turtle(
     phys_iri: str = DEFAULT_OWL_PHYSICAL_IRI,
 ) -> str:
     """Serialize the conceptual schema + physical mapping to OWL Turtle."""
-    classes, relationships = _owl_model(_as_bundle(analysis))
+    classes, relationships = _owl_model(export_bundle(analysis))
     lines: list[str] = [
         f"@prefix : <{base_iri}> .",
         "@prefix owl: <http://www.w3.org/2002/07/owl#> .",
@@ -351,7 +344,7 @@ def export_owl_jsonld(
     phys_iri: str = DEFAULT_OWL_PHYSICAL_IRI,
 ) -> dict[str, Any]:
     """JSON-LD serialization of the same OWL conceptual model as the Turtle export."""
-    classes, relationships = _owl_model(_as_bundle(analysis))
+    classes, relationships = _owl_model(export_bundle(analysis))
     graph: list[dict[str, Any]] = []
     for cls, props in classes:
         graph.append(_jsonld_node(cls))

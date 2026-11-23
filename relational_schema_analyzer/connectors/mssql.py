@@ -55,12 +55,13 @@ import csv
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Iterator, Optional
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import unquote, urlparse
 
 from ..bitemporal import CATALOG
 from ..bitemporal import to_iso as _iso
 from ..check_enum import enrich_check_constraint
 from ..log import get_logger
+from ..quoting import quote_bracket
 from ..types import CheckConstraint, Column, Schema, SourceProvenance, Table
 from .base import group_foreign_keys, mark_one_to_one, unique_columns
 
@@ -86,9 +87,7 @@ def _load_pymssql() -> Any:
     return pymssql
 
 
-def _quote_ident(name: str) -> str:
-    """Bracket-quote a SQL Server identifier, escaping embedded ``]``."""
-    return "[" + name.replace("]", "]]") + "]"
+_quote_ident = quote_bracket  # ``[name]``, doubling ``]``
 
 
 def _parse_mssql_url(url: str) -> dict[str, Any]:
@@ -125,9 +124,6 @@ def _parse_mssql_url(url: str) -> dict[str, Any]:
             "SQL Server connection string is missing a database path component: "
             "mssql://user:pass@host/<database>"
         )
-
-    # Reserved for future tuning knobs (e.g. tds_version); parsed but unused.
-    parse_qs(parsed.query, keep_blank_values=True)
 
     return {
         "server": host,

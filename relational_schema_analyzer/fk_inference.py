@@ -99,6 +99,7 @@ from typing import Any, Callable, Literal, Optional, Sequence, TypeVar, cast
 from pydantic import BaseModel, Field
 
 from .log import get_logger
+from .quoting import quote_ansi, quote_backtick, quote_bracket
 from .typemap import pg_type_to_json_type
 from .types import Column, ForeignKey, Schema, Table
 
@@ -212,24 +213,6 @@ _STRICT_IS_CONCLUSIVE = 0.9
 def _conclusive(exact: Optional[float]) -> bool:
     """Is the strict overlap good enough that normalizing cannot change the outcome?"""
     return exact is not None and exact >= _STRICT_IS_CONCLUSIVE
-
-
-def _pair(row: Any) -> tuple[Optional[float], Optional[float]]:
-    """Read ``(exact, normalized)`` from a result row that may carry only one column.
-
-    Every engine's overlap query selects both, but a cursor is not obliged to hand
-    back two values — a stub, an older driver, or a dialect that folded the second
-    expression away would give one. Treating the missing column as "not measured"
-    degrades to the strict comparison instead of raising.
-    """
-    if not row:
-        return None, None
-    exact = row[0]
-    norm = row[1] if len(row) > 1 else None
-    return (
-        None if exact is None else float(exact),
-        None if norm is None else float(norm),
-    )
 
 
 def _better(exact: Optional[float], norm: Optional[float]) -> Optional[Overlap]:
@@ -351,7 +334,7 @@ def infer_foreign_keys(
     # Composite pass: group single-column candidates sharing (table, foreign_table)
     composite: list[InferredForeignKey] = []
     if opts.allow_composite:
-        composite = _find_composite_candidates(schema, single, declared_index)
+        composite = _find_composite_candidates(schema, declared_index)
 
     # Sampler pass: adjust confidence on every candidate we still have.
     all_candidates = single + composite
@@ -715,7 +698,6 @@ def _types_compatible(a: Column, b: Column) -> bool:
 
 def _find_composite_candidates(
     schema: Schema,
-    single_candidates: list[InferredForeignKey],  # kept for future use (e.g. evidence merging)
     declared_index: dict[str, set[tuple[str, ...]]],
 ) -> list[InferredForeignKey]:
     """Directly scan the schema for composite FK candidates.
@@ -736,7 +718,6 @@ def _find_composite_candidates(
     unrelated to its parents, e.g. ``enrollments`` referencing
     ``course_offerings``).
     """
-    del single_candidates  # parameter reserved for future evidence merging
     out: list[InferredForeignKey] = []
 
     targets = [
@@ -774,13 +755,6 @@ def _find_composite_candidates(
             if not ok:
                 continue
 
-            # Skip if the local table's single-column PK is exactly one
-            # of the pieces (rare but would be a self-inconsistent match).
-            if len(local.primary_key) == 1 and local.primary_key[0] in {pc.name for pc in pk_cols}:
-                # Only treat as composite if *all* pieces are present,
-                # which the loop above already verified.
-                pass
-
             columns = [pc.name for pc in pk_cols]
             foreign_columns = list(key_names)
             if tuple(sorted(columns)) in declared_index.get(local_table, set()):
@@ -799,14 +773,8 @@ def _find_composite_candidates(
                 for lc, pc in zip(matched, pk_cols)
                 if lc.data_type.strip().lower() == pc.data_type.strip().lower()
             )
-            # Penalize matches where the local table also has a plain
-            # "id" column that looks like it already points elsewhere —
-            # the composite is still a valid suggestion but less sure.
             confidence = min(1.0, base + nn_bonus + same_type_bonus)
-            # Exclude local tables that are obviously unrelated (no
-            # shared column names outside the composite pieces) only if
-            # confidence ended up low — we keep clean composite matches
-            # regardless.
+            # A junction table whose own PK is exactly the composite is a sure match.
             if local_pk_set == set(columns):
                 confidence = min(1.0, confidence + 0.05)
             if not is_pk:
@@ -1040,17 +1008,10 @@ class PostgresValueSampler:
                 pass
             return None
 
-    @staticmethod
-    def _qi(name: str) -> str:
-        """Quote an identifier, doubling any embedded quote.
-
-        Names come from the catalog, so this is about correctness rather than
-        injection: a column legitimately named ``a"b`` produced a syntax error, the
-        query was caught, and the probe reported "could not evaluate" — so that
-        table's key could never be found and nothing said why. The DuckDB and
-        Snowflake samplers already quote this way.
-        """
-        return '"' + name.replace('"', '""') + '"'
+    # Doubling an embedded quote is about correctness, not injection (names come from
+    # the catalog): a column legitimately named ``a"b`` broke the query, the probe
+    # reported "could not evaluate", and that table's key could never be found.
+    _qi = staticmethod(quote_ansi)
 
     def _qt(self, table: str) -> str:
         return f"{self._qi(self.schema_name)}.{self._qi(table)}"
@@ -1343,8 +1304,7 @@ class _DerivedTableSampler(_SqlSampler):
     schema_name: str
     limit: int
 
-    def _qi(self, name: str) -> str:
-        return "`" + name.replace("`", "``") + "`"
+    _qi = staticmethod(quote_backtick)
 
     def _qt(self, table: str) -> str:
         return f"{self._qi(self.schema_name)}.{self._qi(table)}"
@@ -1534,8 +1494,7 @@ class SQLServerValueSampler(_SqlSampler):
             self._conn = pymssql.connect(**self._connect_params)
         return self._conn
 
-    def _qi(self, name: str) -> str:
-        return "[" + name.replace("]", "]]") + "]"
+    _qi = staticmethod(quote_bracket)
 
     def __call__(
         self,
@@ -1755,8 +1714,7 @@ class DuckDbValueSampler(_SqlSampler):
 
     _log_name = "duckdb_sampler"
 
-    def _qi(self, name: str) -> str:
-        return '"' + name.replace('"', '""') + '"'
+    _qi = staticmethod(quote_ansi)
 
     # ── Dialect hooks: everything below them is shared with SqliteValueSampler ──
 
@@ -1976,34 +1934,8 @@ class CsvValueSampler:
         would otherwise score near zero. Reading one column of one CSV in full is the
         price of a correct answer, and for a file-backed source it is a cheap one.
         """
-        import polars as pl
-
-        path = self._resolve(table)
-        if path is None:
-            return None
-        try:
-            frame = pl.read_csv(
-                str(path),
-                separator=self.delimiter,
-                has_header=self.has_header,
-                columns=[column],
-                n_rows=self.limit if bounded else None,
-                infer_schema_length=0,  # read everything as Utf8 (raw text)
-            )
-        except Exception as err:  # noqa: BLE001
-            logger.warning(
-                "csv_fk_sampler_read_failed",
-                table=table,
-                column=column,
-                error=str(err),
-            )
-            return None
-        if not frame.columns:
-            return None
-        series = frame.get_column(frame.columns[0])
-        return {
-            v for v in series.to_list() if v is not None and str(v) != ""
-        }
+        series = self._text_values(table, column, bounded=bounded)
+        return None if series is None else set(series.to_list())
 
     def __call__(
         self,
@@ -2034,46 +1966,58 @@ class CsvValueSampler:
 
     # ── Denormalization probes (PRD Phase 11) ──────────────────────
 
-    def _read_columns(self, table: str, columns: list[str]):
-        """Read ``columns`` of ``table`` as raw text (type inference off), bounded
-        by ``limit``; returns a Polars frame or ``None`` if unreadable."""
+    def _read_columns(self, table: str, columns: list[str], *, bounded: bool = True):
+        """Read ``columns`` of ``table`` as raw text (type inference off), capped at
+        ``limit`` rows unless ``bounded=False``; a Polars frame, or ``None`` if unreadable.
+
+        r2g's ``CsvValueSampler`` subclass calls this too.
+        """
         import polars as pl
 
         path = self._resolve(table)
         if path is None:
             return None
         try:
-            return pl.read_csv(
+            frame = pl.read_csv(
                 str(path),
                 separator=self.delimiter,
                 has_header=self.has_header,
                 columns=columns,
-                n_rows=self.limit,
-                infer_schema_length=0,
+                n_rows=self.limit if bounded else None,
+                infer_schema_length=0,  # read everything as Utf8 (raw text)
             )
         except Exception as err:  # noqa: BLE001
-            logger.warning(
-                "csv_denorm_sampler_read_failed", table=table, columns=columns, error=str(err)
-            )
+            logger.warning("csv_sampler_read_failed", table=table, columns=columns, error=str(err))
             return None
+        return frame if frame.columns else None
 
-    def distinct_ratio(self, table: str, column: str) -> SamplerResult:
+    @staticmethod
+    def _present(frame: Any, columns: list[str]) -> Any:
+        """Rows where every one of ``columns`` holds a value (not NULL, not empty).
+
+        Filters the frame, not a Series: ``DataFrame.filter`` takes expressions while
+        ``Series.filter`` wants a boolean mask and raises on an expression. With type
+        inference off every column is text, so ``!= ""`` is a valid emptiness test.
+        """
         import polars as pl
 
-        frame = self._read_columns(table, [column])
-        if frame is None or not frame.columns:
+        for c in columns:
+            frame = frame.filter(pl.col(c).is_not_null() & (pl.col(c) != ""))
+        return frame
+
+    def _text_values(self, table: str, column: str, *, bounded: bool = True) -> Any:
+        """One column's present values as a text Series, or ``None`` if unreadable."""
+        frame = self._read_columns(table, [column], bounded=bounded)
+        if frame is None:
             return None
-        # Filter on the frame, not the Series: ``DataFrame.filter`` takes
-        # expressions while ``Series.filter`` wants a boolean mask, and passing an
-        # expression to the latter raises. Reading text with inference off means
-        # ``!= ""`` is a valid emptiness test on every column.
         name = frame.columns[0]
-        frame = frame.filter(pl.col(name).is_not_null() & (pl.col(name) != ""))
-        series = frame.get_column(name)
-        total = series.len()
-        if total == 0:
+        return self._present(frame, [name]).get_column(name)
+
+    def distinct_ratio(self, table: str, column: str) -> SamplerResult:
+        series = self._text_values(table, column)
+        if series is None or series.len() == 0:
             return None
-        return float(series.n_unique() / total)
+        return float(series.n_unique() / series.len())
 
     def group_single_valued(
         self, table: str, determinant_columns: list[str], dependent_column: str
@@ -2081,10 +2025,9 @@ class CsvValueSampler:
         import polars as pl
 
         frame = self._read_columns(table, [*determinant_columns, dependent_column])
-        if frame is None or not frame.columns:
+        if frame is None:
             return None
-        for d in determinant_columns:
-            frame = frame.filter(pl.col(d).is_not_null() & (pl.col(d) != ""))
+        frame = self._present(frame, determinant_columns)
         if frame.is_empty():
             return None
         grouped = frame.group_by(determinant_columns).agg(
@@ -2096,21 +2039,11 @@ class CsvValueSampler:
         return float(single.sum() / single.len())
 
     def delimiter_rate(self, table: str, column: str, delimiter: str) -> SamplerResult:
-        import polars as pl
-
-        frame = self._read_columns(table, [column])
-        if frame is None or not frame.columns:
-            return None
-        name = frame.columns[0]
-        # Same as distinct_ratio: filter the frame (expressions) rather than the
-        # Series (boolean mask), which raises on an expression.
-        frame = frame.filter(pl.col(name).is_not_null() & (pl.col(name) != ""))
-        series = frame.get_column(name)
-        total = series.len()
-        if total == 0:
+        series = self._text_values(table, column)
+        if series is None or series.len() == 0:
             return None
         contains = series.str.contains(delimiter, literal=True)
-        return float(contains.sum() / total)
+        return float(contains.sum() / series.len())
 
 
 # ── Concrete Snowflake value sampler (cost-governed) ──────────────────
@@ -2298,9 +2231,7 @@ class SnowflakeValueSampler:
             logger.warning("snowflake_sampler_query_failed", error=str(err))
             return None
 
-    @staticmethod
-    def _ident(name: str) -> str:
-        return '"' + name.replace('"', '""') + '"'
+    _ident = staticmethod(quote_ansi)
 
     def _table(self, table: str) -> str:
         return f"{self._ident(self.schema_name)}.{self._ident(table)}"
@@ -2504,20 +2435,16 @@ def create_value_sampler(
 
     PostgreSQL (incl. ``postgres`` / ``pg`` aliases) → :class:`PostgresValueSampler`,
     MySQL / MariaDB → :class:`MySQLValueSampler`, SQL Server →
-    :class:`SQLServerValueSampler`, DuckDB → :class:`DuckDbValueSampler`, Databricks → :class:`DatabricksValueSampler`,
+    :class:`SQLServerValueSampler`, DuckDB → :class:`DuckDbValueSampler`, SQLite →
+    :class:`SqliteValueSampler`, Databricks → :class:`DatabricksValueSampler`,
     Snowflake → :class:`SnowflakeValueSampler` (cost-governed),
     CSV → :class:`CsvValueSampler`; any other type returns ``None`` (the caller
     should fall back to name-only inference). Connector / import errors are
     allowed to propagate so callers can decide whether to log-and-continue.
     """
-    from .connectors.base import (
-        expand_env_vars,
-        is_mysql,
-        is_postgresql,
-        is_sqlserver,
-        normalize_source_type,
-    )
+    from .connectors.base import expand_env_vars, normalize_source_type
 
+    key = normalize_source_type(source_type)
     params = source_params or {}
     # Resolve $VAR credential references the same way create_source_connector does.
     connection_string = expand_env_vars(connection_string)
@@ -2530,26 +2457,26 @@ def create_value_sampler(
         )
         if v is not None
     }
-    if is_postgresql(source_type):
+    if key == "postgresql":
         return PostgresValueSampler(
             connection_string, schema_name=pg_schema, limit=limit, **governance
         )
-    if is_mysql(source_type):
+    if key == "mysql":
         return MySQLValueSampler(connection_string, schema_name=pg_schema, limit=limit)
-    if is_sqlserver(source_type):
+    if key == "sqlserver":
         return SQLServerValueSampler(connection_string, schema_name=pg_schema, limit=limit)
-    if normalize_source_type(source_type) == "duckdb":
+    if key == "duckdb":
         return DuckDbValueSampler(connection_string, schema_name=pg_schema, limit=limit)
-    if normalize_source_type(source_type) == "sqlite":
+    if key == "sqlite":
         return SqliteValueSampler(connection_string, limit=limit)
-    if normalize_source_type(source_type) == "databricks":
+    if key == "databricks":
         return DatabricksValueSampler(connection_string, schema_name=pg_schema, limit=limit)
-    if normalize_source_type(source_type) == "snowflake":
+    if key == "snowflake":
         # Governed by default (query budget + statement timeout); see the class.
         return SnowflakeValueSampler(
             connection_string, schema_name=pg_schema, limit=limit, **governance
         )
-    if normalize_source_type(source_type) == "csv":
+    if key == "csv":
         return CsvValueSampler(
             connection_string,
             delimiter=params.get("delimiter", ","),

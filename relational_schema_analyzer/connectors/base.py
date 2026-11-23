@@ -36,6 +36,7 @@ import os
 from collections.abc import Iterable, Mapping
 from typing import Any, Protocol, TypeGuard, runtime_checkable
 
+from ..quoting import quote_ansi
 from .session import SourceSession
 from ..types import Column, ForeignKey, Schema, Table
 
@@ -147,13 +148,8 @@ _MSSQL_ALIASES: frozenset[str] = frozenset({"sqlserver", "mssql", "sql_server"})
 _SQLITE_ALIASES: frozenset[str] = frozenset({"sqlite", "sqlite3"})
 
 
-def quote_identifier(name: str) -> str:
-    """A double-quoted SQL identifier, with any ``"`` inside it doubled.
-
-    The ANSI rule that Postgres and Snowflake follow. Wrapping a name in quotes without
-    doubling breaks the statement for a name that contains ``"`` (#55).
-    """
-    return '"' + name.replace('"', '""') + '"'
+# The ANSI rule Postgres and Snowflake follow: ``"name"`` with any ``"`` doubled (#55).
+quote_identifier = quote_ansi
 
 
 def merge_unique_sets(

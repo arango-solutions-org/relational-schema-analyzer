@@ -53,7 +53,7 @@ Lift from `r2g` with minimal edits. **Extraction inventory** (source → destina
 | `src/r2g/fk_inference.py` | `fk_inference.py` | name + value-overlap heuristics |
 | `src/r2g/schema_diff.py` | `schema_diff.py` | reused for fingerprint/drift |
 | `src/r2g/topo_sort.py` | `topo_sort.py` | |
-| `src/r2g/config.py::pg_type_to_json_type`, `DEFAULT_TYPE_MAP`, `_is_likely_join_table` | `typemap.py` + `heuristics.py` | the type map + join-table heuristic only |
+| `src/r2g/config.py::pg_type_to_json_type`, `DEFAULT_TYPE_MAP`, `_is_likely_join_table` | `typemap.py` | the type map only (the join-table heuristic was ported as `heuristics.py`, never used, and removed in #60) |
 | relevant `tests/` (`test_*_connector.py`, `test_fk_inference.py`, `test_schema_diff.py`, CSV) | `tests/` | port as-is |
 
 **Stays in r2g** (not extracted): `config.py` (MappingConfig generation), `config_migrate.py`,
@@ -65,7 +65,7 @@ Progress (extraction landed in this pass):
 - [x] `connectors/` (`base` + `create_connector` factory, `session`, `postgres`, `mysql`,
       `mssql`, `snowflake`, `csv_source`). Kafka **dropped** for v0 (decision §9.3).
 - [x] `typemap.py` (`DEFAULT_TYPE_MAP` + `pg_type_to_json_type`), `heuristics.py`
-      (`is_likely_join_table`), `naming.py` (dependency-free subset), `dump_reader.py`
+      (`is_likely_join_table`; unused, removed in #60), `naming.py` (dependency-free subset), `dump_reader.py`
 - [x] `schema_diff.py`, `topo_sort.py`
 - [x] `fk_inference.py` — decoupled from the Arango `EdgeDefinition`: the
       `to_edge_definition()` helper is replaced by relational-native

@@ -27,8 +27,8 @@ from collections.abc import Callable
 from typing import Any, Optional
 
 from .connectors.base import normalize_source_type, quote_identifier
-from .connectors.mssql import _quote_ident as _bracket_quote
-from .connectors.mysql import _quote_ident as _backtick_quote
+from .quoting import quote_backtick as _backtick_quote
+from .quoting import quote_bracket as _bracket_quote
 
 logger = logging.getLogger(__name__)
 

@@ -33,7 +33,7 @@ import sys
 from typing import Any
 
 from .log import keep_logs_off_stdout
-from .tool import CONTRACT_VERSION, run_tool
+from .tool import CONTRACT_VERSION, _error, run_tool
 
 logger = logging.getLogger(__name__)
 
@@ -123,11 +123,9 @@ def build_app(*, host: str | None = None, port: int | None = None) -> Any:
         try:
             req = json.loads(request_json)
         except json.JSONDecodeError as e:
-            return {"contractVersion": CONTRACT_VERSION, "operation": None, "ok": False,
-                    "error": {"code": "INVALID_REQUEST", "message": f"Invalid JSON: {e}"}}
+            return _error(None, "INVALID_REQUEST", f"Invalid JSON: {e}")
         if not isinstance(req, dict):
-            return {"contractVersion": CONTRACT_VERSION, "operation": None, "ok": False,
-                    "error": {"code": "INVALID_REQUEST", "message": "request_json must be an object"}}
+            return _error(None, "INVALID_REQUEST", "request_json must be an object")
         return run_tool(req)
 
     @mcp.tool()

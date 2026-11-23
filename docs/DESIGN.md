@@ -248,7 +248,9 @@ model with no LLM. Rules:
 | Shared-PK-is-also-FK (table whose PK is an FK to parent) | candidate `rdfs:subClassOf` (inheritance) — flag for review |
 | Missing declared FKs | run `fk_inference` (name + value-overlap heuristics) → relationships marked lower confidence |
 
-Join-table detection reuses r2g's existing `_is_likely_join_table()` heuristic.
+Join-table detection is `baseline._is_join_table`: exactly two FKs whose columns form the PK. It
+is stricter than r2g's `_is_likely_join_table()`, and any other columns become relationship
+properties.
 
 ### LLM refinement (optional, additive)
 

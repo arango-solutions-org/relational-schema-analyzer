@@ -14,7 +14,7 @@ Rules
   marked ``unique``).
 - Foreign key → ``FOREIGN_KEY`` relationship; cardinality ``1:1`` when the FK
   columns are exactly the local PK, else ``1:N``.
-- Associative / join table (2 FKs, per ``is_likely_join_table``) → ``JOIN_TABLE``
+- Associative / join table (2 FKs forming the PK, per ``_is_join_table``) → ``JOIN_TABLE``
   relationship (``N:M``); non-structural columns become relationship properties.
 - Shared-PK-is-also-FK (single-col PK that is itself an FK) → ``rdfs:subClassOf``
   candidate, review-flagged.
@@ -27,7 +27,7 @@ from __future__ import annotations
 from typing import Any
 
 from .discriminator import is_shared_pk_fk
-from .fk_inference import infer_foreign_keys
+from .fk_inference import InferredForeignKey, infer_foreign_keys
 from .naming import convert_identifier
 from .overlay import overlay_applied, overlay_summary
 from .typemap import pg_type_to_json_type
@@ -82,35 +82,69 @@ def _is_key_column(col: Any, pk: list[str]) -> bool:
     return bool(getattr(col, "is_unique", False)) or (col.name in pk and len(pk) == 1)
 
 
+def _key_flags(col: Any, pk: list[str]) -> dict[str, Any]:
+    """``indexed`` for any PK or key column, ``unique`` for a key column; else nothing."""
+    is_key = _is_key_column(col, pk)
+    flags: dict[str, Any] = {}
+    if col.name in pk or is_key:
+        flags["indexed"] = True
+    if is_key:
+        flags["unique"] = True
+    return flags
+
+
 def _property_def(col: Any, pk: list[str]) -> dict[str, Any]:
-    prop: dict[str, Any] = {
+    return {
         "name": col.name,
         "type": pg_type_to_json_type(col.data_type),
         "nullable": bool(col.is_nullable),
+        **_key_flags(col, pk),
     }
-    if col.name in pk or _is_key_column(col, pk):
-        prop["indexed"] = True
-    if _is_key_column(col, pk):
-        prop["unique"] = True
-    return prop
 
 
 def _physical_property(col: Any, pk: list[str]) -> dict[str, Any]:
     # ``field`` is the contract-required back-reference to the physical column;
     # ``sqlType`` / ``nullable`` are relational additions carried alongside.
-    entry: dict[str, Any] = {
+    return {
         "field": col.name,
         "sqlType": col.data_type,
         "nullable": bool(col.is_nullable),
+        **_key_flags(col, pk),
     }
-    if col.name in pk or _is_key_column(col, pk):
-        entry["indexed"] = True
-    if _is_key_column(col, pk):
-        entry["unique"] = True
-    return entry
 
 
-def _cardinality_for_fk(fk: ForeignKey, local: Table) -> str:
+def _relationship(
+    rel_type: str,
+    from_entity: str,
+    to_entity: str,
+    cardinality: str,
+    properties: list[dict[str, Any]] | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """One ``conceptualSchema.relationships`` entry."""
+    return {
+        "type": rel_type,
+        "fromEntity": from_entity,
+        "toEntity": to_entity,
+        "properties": properties or [],
+        "cardinality": cardinality,
+        "source": _SOURCE_BASELINE,
+        **extra,
+    }
+
+
+def _fk_mapping(fk: ForeignKey | InferredForeignKey, from_table: str) -> dict[str, Any]:
+    """The ``FOREIGN_KEY`` physical mapping for a declared or inferred key."""
+    return {
+        "style": "FOREIGN_KEY",
+        "fromTable": from_table,
+        "fromColumns": list(fk.columns),
+        "toTable": fk.foreign_table,
+        "toColumns": list(fk.foreign_columns),
+    }
+
+
+def _cardinality_for_fk(fk: ForeignKey | InferredForeignKey, local: Table) -> str:
     """``1:1`` when the FK is itself unique (or equals the local PK), else ``1:N``."""
     if getattr(fk, "is_unique", False):
         return "1:1"
@@ -247,16 +281,7 @@ def infer_baseline(schema: PhysicalSchema) -> dict[str, Any]:
         base = f"{from_entity}_{to_entity}"
         rel_type = _unique_rel_type(base, table.primary_key or [table_name], used_rel_types)
 
-        relationships.append(
-            {
-                "type": rel_type,
-                "fromEntity": from_entity,
-                "toEntity": to_entity,
-                "properties": rel_props,
-                "cardinality": "N:M",
-                "source": _SOURCE_BASELINE,
-            }
-        )
+        relationships.append(_relationship(rel_type, from_entity, to_entity, "N:M", rel_props))
         join_map: dict[str, Any] = {
             "style": "JOIN_TABLE",
             "joinTable": table_name,
@@ -293,22 +318,8 @@ def infer_baseline(schema: PhysicalSchema) -> dict[str, Any]:
             base = f"{from_entity}_{to_entity}"
             rel_type = _unique_rel_type(base, fk.columns, used_rel_types)
 
-            rel: dict[str, Any] = {
-                "type": rel_type,
-                "fromEntity": from_entity,
-                "toEntity": to_entity,
-                "properties": [],
-                "cardinality": cardinality,
-                "source": _SOURCE_BASELINE,
-            }
-            relationships.append(rel)
-            pm_rel: dict[str, Any] = {
-                "style": "FOREIGN_KEY",
-                "fromTable": table_name,
-                "fromColumns": list(fk.columns),
-                "toTable": fk.foreign_table,
-                "toColumns": list(fk.foreign_columns),
-            }
+            relationships.append(_relationship(rel_type, from_entity, to_entity, cardinality))
+            pm_rel = _fk_mapping(fk, table_name)
             if not fk.enforced:
                 pm_rel["enforced"] = False
             pm_relationships[rel_type] = pm_rel
@@ -345,32 +356,17 @@ def infer_baseline(schema: PhysicalSchema) -> dict[str, Any]:
                 continue
             from_entity = entity_name_by_table[cand.table]
             to_entity = entity_name_by_table[cand.foreign_table]
-            local = schema.tables[cand.table]
-            cardinality = (
-                "1:1"
-                if local.primary_key and set(cand.columns) == set(local.primary_key)
-                else "1:N"
-            )
+            cardinality = _cardinality_for_fk(cand, schema.tables[cand.table])
             base = f"{from_entity}_{to_entity}"
             rel_type = _unique_rel_type(base, cand.columns, used_rel_types)
             relationships.append(
-                {
-                    "type": rel_type,
-                    "fromEntity": from_entity,
-                    "toEntity": to_entity,
-                    "properties": [],
-                    "cardinality": cardinality,
-                    "source": _SOURCE_BASELINE,
-                    "inferred": True,
-                    "confidence": cand.confidence,
-                }
+                _relationship(
+                    rel_type, from_entity, to_entity, cardinality,
+                    inferred=True, confidence=cand.confidence,
+                )
             )
             pm_relationships[rel_type] = {
-                "style": "FOREIGN_KEY",
-                "fromTable": cand.table,
-                "fromColumns": list(cand.columns),
-                "toTable": cand.foreign_table,
-                "toColumns": list(cand.foreign_columns),
+                **_fk_mapping(cand, cand.table),
                 "inferred": True,
                 # An inferred FK isn't declared at all, let alone guaranteed.
                 # Emitting this keeps one invariant true for consumers: a
