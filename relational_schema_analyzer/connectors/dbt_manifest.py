@@ -27,6 +27,7 @@ from ..log import get_logger
 from ..bitemporal import FILE
 from ..bitemporal import to_iso as _iso
 from ..types import CheckConstraint, Column, ForeignKey, Schema, SourceProvenance, Table
+from .base import mark_one_to_one
 
 logger = get_logger(__name__)
 
@@ -273,11 +274,7 @@ class DbtManifestConnector:
                 seen.add(key)
                 unique_constraints.append(list(u))
 
-        unique_col_sets = [set(u) for u in unique_constraints]
-        if acc.pk:
-            unique_col_sets.append(set(acc.pk))
-        for fk in acc.fks:
-            fk.is_unique = set(fk.columns) in unique_col_sets
+        mark_one_to_one(acc.fks, acc.pk, unique_constraints)
 
         return Table(
             name=acc.name,

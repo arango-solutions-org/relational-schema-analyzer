@@ -32,8 +32,10 @@ from typing import Any
 
 from ..log import get_logger
 from ..bitemporal import FILE
+from ..bitemporal import file_mtime_iso
 from ..bitemporal import to_iso as _iso
 from ..types import Column, ForeignKey, Schema, SourceProvenance, Table
+from .base import is_one_to_one, unique_columns
 
 logger = get_logger(__name__)
 
@@ -108,7 +110,7 @@ class OsiConnector:
             doc.get("generated_at")
             or doc.get("updated_at")
             or doc_meta.get("generated_at")
-        ) or _file_mtime_iso(path)
+        ) or file_mtime_iso(path)
 
         schema = Schema()
         db_hint: str | None = None
@@ -166,9 +168,7 @@ class OsiConnector:
                 unique_constraints.append(cols)
 
         # Single-column uniqueness (PK or a 1-col unique key) marks the column unique.
-        single_unique = {u[0] for u in unique_constraints if len(u) == 1}
-        if len(pk) == 1:
-            single_unique.add(pk[0])
+        single_unique = unique_columns(pk, unique_constraints)
 
         columns: list[Column] = []
         for ordinal, field in enumerate(_as_list(dataset.get("fields"))):
@@ -235,23 +235,12 @@ class OsiConnector:
                 continue
             # OSI relationships are many-to-one (from -> to): the from columns are
             # unique only when they exactly match a unique key / PK of the from table.
-            unique_sets = [set(u) for u in table.unique_constraints]
-            if table.primary_key:
-                unique_sets.append(set(table.primary_key))
             table.foreign_keys.append(
                 ForeignKey(
                     columns=from_cols,
                     foreign_table=str(to_ds),
                     foreign_columns=to_cols,
                     constraint_name=(rel.get("name") or None),
-                    is_unique=set(from_cols) in unique_sets,
+                    is_unique=is_one_to_one(from_cols, table.primary_key, table.unique_constraints),
                 )
             )
-
-
-def _file_mtime_iso(path: Path) -> Any:
-    """The model document's mtime as ISO-8601 UTC, or ``None`` if unreadable."""
-    try:
-        return _iso(path.stat().st_mtime)
-    except OSError:
-        return None

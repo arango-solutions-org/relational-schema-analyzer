@@ -33,10 +33,11 @@ inside ``PostgresSession`` and the Snowflake equivalents inside
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable, Mapping
 from typing import Any, Protocol, TypeGuard, runtime_checkable
 
 from .session import SourceSession
-from ..types import Schema
+from ..types import Column, ForeignKey, Schema, Table
 
 
 def expand_env_vars(connection_string: str) -> str:
@@ -177,6 +178,163 @@ def merge_unique_sets(
     return merged
 
 
+# ── Table assembly shared by the connectors ─────────────────────────────────
+#
+# Every connector decided "is this column unique on its own" and "is this foreign key
+# one-to-one" the same way, written out nine times; three built identical tables (#58).
+
+
+def unique_columns(primary_key: list[str], unique_sets: list[list[str]]) -> set[str]:
+    """Columns unique on their own: a one-column UNIQUE set, or a one-column primary key."""
+    single = {u[0] for u in unique_sets if len(u) == 1}
+    if len(primary_key) == 1:
+        single.add(primary_key[0])
+    return single
+
+
+def is_one_to_one(
+    columns: list[str], primary_key: list[str], unique_sets: list[list[str]]
+) -> bool:
+    """A foreign key is one-to-one when its columns are exactly a unique set or the key."""
+    keys = [set(u) for u in unique_sets]
+    if primary_key:
+        keys.append(set(primary_key))
+    return set(columns) in keys
+
+
+def mark_one_to_one(
+    fks: Iterable[ForeignKey], primary_key: list[str], unique_sets: list[list[str]]
+) -> None:
+    """Set each foreign key's ``is_unique`` (see :func:`is_one_to_one`)."""
+    for fk in fks:
+        fk.is_unique = is_one_to_one(fk.columns, primary_key, unique_sets)
+
+
+def build_table(
+    *,
+    name: str,
+    schema_name: str,
+    columns: list[dict[str, Any]],
+    primary_key: list[str],
+    unique_sets: list[list[str]],
+    fks: list[ForeignKey],
+    is_view: bool = False,
+    comment: str | None = None,
+) -> Table:
+    """A :class:`Table` from per-column dicts.
+
+    Each dict has ``name``, ``data_type``, ``is_nullable``, ``default`` and ``ordinal``, and
+    may have ``comment``. Uniqueness and each foreign key's ``is_unique`` follow from the
+    key sets.
+    """
+    pk = set(primary_key)
+    single = unique_columns(primary_key, unique_sets)
+    mark_one_to_one(fks, primary_key, unique_sets)
+    return Table(
+        name=name,
+        columns=[
+            Column(
+                name=c["name"],
+                data_type=c["data_type"],
+                is_nullable=c["is_nullable"],
+                is_primary_key=c["name"] in pk,
+                is_unique=c["name"] in single,
+                default=c["default"],
+                comment=c.get("comment"),
+                ordinal=c["ordinal"],
+            )
+            for c in columns
+        ],
+        primary_key=primary_key,
+        foreign_keys=fks,
+        is_view=is_view,
+        comment=comment,
+        schema_name=schema_name,
+        unique_constraints=[list(u) for u in unique_sets],
+    )
+
+
+def fold_constraints(
+    table_constraints: Iterable[tuple[Any, Any, Any]],
+    key_column_usage: Iterable[tuple[Any, Any, Any]],
+    referential_constraints: Iterable[tuple[Any, Any]],
+    *,
+    enforced: bool = True,
+) -> tuple[dict[str, list[str]], dict[str, list[list[str]]], dict[str, list[ForeignKey]]]:
+    """Primary keys, unique sets and foreign keys per table, from ``information_schema``.
+
+    Takes the rows of ``table_constraints`` (name, type, table), ``key_column_usage``
+    (name, column, position; ordered by name and position) and ``referential_constraints``
+    (name, referenced unique constraint). A foreign key whose referenced constraint cannot
+    be resolved is skipped. Each connector keeps its own queries.
+    """
+    cols_by_constraint: dict[str, list[str]] = {}
+    for cname, col, _pos in key_column_usage:
+        cols_by_constraint.setdefault(cname, []).append(col)
+    type_by_constraint: dict[str, str] = {}
+    table_by_constraint: dict[str, str] = {}
+    for cname, ctype, table_name in table_constraints:
+        type_by_constraint[cname] = ctype
+        table_by_constraint[cname] = table_name
+    referenced = {cname: uc for cname, uc in referential_constraints}
+
+    pks: dict[str, list[str]] = {}
+    uniques: dict[str, list[list[str]]] = {}
+    fks: dict[str, list[ForeignKey]] = {}
+    for cname, ctype in type_by_constraint.items():
+        table_name = table_by_constraint[cname]
+        cols = cols_by_constraint.get(cname, [])
+        if ctype == "PRIMARY KEY":
+            pks[table_name] = cols
+        elif ctype == "UNIQUE":
+            uniques.setdefault(table_name, []).append(cols)
+        elif ctype == "FOREIGN KEY":
+            uc = referenced.get(cname)
+            ref_table = table_by_constraint.get(uc) if uc else None
+            ref_cols = cols_by_constraint.get(uc, []) if uc else []
+            if not ref_table or not ref_cols:
+                continue
+            fks.setdefault(table_name, []).append(
+                ForeignKey(
+                    columns=cols,
+                    foreign_table=ref_table,
+                    foreign_columns=ref_cols,
+                    constraint_name=cname,
+                    enforced=enforced,
+                )
+            )
+    return pks, uniques, fks
+
+
+def group_foreign_keys(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    constraint: str,
+    column: str,
+    ref_table: str,
+    ref_column: str,
+) -> list[ForeignKey]:
+    """One :class:`ForeignKey` per constraint, from one row per column pair, in row order.
+
+    The key names say which field of each row holds what, so each connector keeps its
+    catalog's own column names.
+    """
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        bucket = grouped.setdefault(
+            row[constraint],
+            {
+                "columns": [],
+                "foreign_table": row[ref_table],
+                "foreign_columns": [],
+                "constraint_name": row[constraint],
+            },
+        )
+        bucket["columns"].append(row[column])
+        bucket["foreign_columns"].append(row[ref_column])
+    return [ForeignKey(**b) for b in grouped.values()]
+
+
 def normalize_source_type(source_type: str | None) -> str:
     """Canonicalize a source-type string.
 
@@ -252,7 +410,7 @@ def create_connector(
     raise :class:`ImportError` with a pip-install hint.
 
     ``source_params`` carries type-specific configuration (e.g. CSV
-    ``delimiter`` / ``has_header``). PostgreSQL and Snowflake ignore it.
+    ``delimiter`` / ``has_header``). Every other source ignores it.
     """
 
     key = normalize_source_type(source_type)

@@ -34,7 +34,7 @@ from ..bitemporal import to_iso as _iso
 from ..check_enum import enrich_check_constraint
 from ..log import get_logger
 from ..types import CheckConstraint, Column, ForeignKey, Schema, SourceProvenance, Table
-from .base import quote_identifier
+from .base import group_foreign_keys, mark_one_to_one, quote_identifier, unique_columns
 
 logger = get_logger(__name__)
 
@@ -354,9 +354,7 @@ class PostgresConnector:
         pks = [row["column_name"] for row in cur.fetchall()]
 
         unique_sets = self._fetch_unique_constraints(cur, table_name, pks)
-        single_unique = {u[0] for u in unique_sets if len(u) == 1}
-        if len(pks) == 1:
-            single_unique.add(pks[0])
+        single_unique = unique_columns(pks, unique_sets)
 
         columns = []
         for c in columns_data:
@@ -400,27 +398,14 @@ class PostgresConnector:
         )
         fks_data = cur.fetchall()
 
-        grouped: OrderedDict[str, dict] = OrderedDict()
-        for fk in fks_data:
-            cname = fk["constraint_name"]
-            if cname not in grouped:
-                grouped[cname] = {
-                    "columns": [],
-                    "foreign_table": fk["foreign_table_name"],
-                    "foreign_columns": [],
-                    "constraint_name": cname,
-                }
-            grouped[cname]["columns"].append(fk["column_name"])
-            grouped[cname]["foreign_columns"].append(fk["foreign_column_name"])
-
-        fks = [ForeignKey(**v) for v in grouped.values()]
-
-        # FK cardinality hint: 1:1 when the FK columns are a unique key (or the PK).
-        unique_col_sets = [set(u) for u in unique_sets]
-        if pks:
-            unique_col_sets.append(set(pks))
-        for fk_obj in fks:
-            fk_obj.is_unique = set(fk_obj.columns) in unique_col_sets
+        fks = group_foreign_keys(
+            fks_data,
+            constraint="constraint_name",
+            column="column_name",
+            ref_table="foreign_table_name",
+            ref_column="foreign_column_name",
+        )
+        mark_one_to_one(fks, pks, unique_sets)
 
         # Value lists are read from the expression; a ``NOT VALID`` constraint, whose
         # existing rows were never checked, is left without them (see ``check_enum``).
