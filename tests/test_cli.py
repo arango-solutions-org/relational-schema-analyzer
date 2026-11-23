@@ -22,6 +22,16 @@ def snapshot_file(tmp_path) -> str:
 
 
 class TestSnapshot:
+    def test_help_names_every_source_type(self, capsys):
+        # The list was hand-written and named 5 of the 10 types (#60).
+        from relational_schema_analyzer.connectors import SUPPORTED_SOURCE_TYPES
+
+        with pytest.raises(SystemExit):
+            main(["snapshot", "--help"])
+        help_text = " ".join(capsys.readouterr().out.split())
+        for source_type in SUPPORTED_SOURCE_TYPES:
+            assert source_type in help_text
+
     def test_writes_valid_physical_schema(self, snapshot_file):
         schema = PhysicalSchema.load_from_file(snapshot_file)
         assert sorted(schema.tables) == ["authors", "books", "loans", "members"]

@@ -41,7 +41,7 @@ from math import comb
 from typing import Any, Optional, Protocol, Sequence
 
 from .naming import singularize
-from .types import Schema, Table
+from .types import Column, Schema, Table
 
 ColumnStats = tuple[int, int, int]
 """``(rows, non_null, distinct)`` for one column over the probed rows."""
@@ -316,49 +316,71 @@ def _profile_additional_keys(
     if not usable:
         return
 
-    sample = probe.column_stats(table.name, [c.name for _, c in usable], sample=True)
-    if sample is None:
+    stopped, found, _ = _unique_single_columns(
+        table, probe, usable, references, table_names,
+        note=(
+            "the table already declares a primary key; this is an "
+            "additional candidate key, not a replacement",
+        ),
+    )
+    if stopped == "screen":
         profile.not_evaluated.setdefault(
             table.name, "probe declined while looking for additional keys"
         )
-        return
+    elif stopped == "confirm":
+        profile.not_evaluated.setdefault(
+            table.name, "probe declined confirming an additional key"
+        )
+    elif found:
+        found.sort(key=lambda k: (-k.score, k.columns))
+        profile.additional[table.name] = found
+
+
+def _unique_single_columns(
+    table: Table,
+    probe: KeyProbe,
+    usable: list[tuple[int, Column]],
+    references: dict[str, str],
+    table_names: set[str],
+    *,
+    note: tuple[str, ...] = (),
+) -> tuple[Optional[str], list[KeyCandidate], bool]:
+    """Screen ``usable`` on a sample, confirm the survivors over the whole table, score them.
+
+    Returns ``(stopped, found, whole_table_seen)``. ``stopped`` says where the search
+    ended early, so each caller can record its own "not evaluated" reason: ``"screen"``
+    (the sample probe declined), ``"empty"`` (no rows), ``"confirm"`` (the whole-table
+    probe declined), or ``None`` when it ran to the end. ``note`` is appended to every
+    candidate's reasons.
+    """
+    # 1. Screen on a sample: a duplicate or NULL here is conclusive.
+    sample = probe.column_stats(table.name, [c.name for _, c in usable], sample=True)
+    if sample is None:
+        return "screen", [], False
     sampled_rows = next(iter(sample.values()))[0] if sample else 0
     if sampled_rows == 0:
-        return
+        return "empty", [], True
     survivors = [(i, c) for i, c in usable if _is_unique_non_null(sample[c.name])]
-    if not survivors:
-        return
 
-    exact = sample
-    if sampled_rows >= probe.limit:
+    # 2. Confirm over the whole table, unless the sample already was the whole table.
+    whole_table_seen = sampled_rows < probe.limit
+    exact: dict[str, ColumnStats] = sample
+    if survivors and not whole_table_seen:
         confirmed = probe.column_stats(table.name, [c.name for _, c in survivors], sample=False)
         if confirmed is None:
-            profile.not_evaluated.setdefault(
-                table.name, "probe declined confirming an additional key"
-            )
-            return
+            return "confirm", [], False
         exact = confirmed
 
     found: list[KeyCandidate] = []
     for position, col in survivors:
         stats = exact[col.name]
         if not _is_unique_non_null(stats):
-            continue
+            continue  # unique in the sample only
         score, reasons = _score_single(table, col, position, stats[0], references, table_names)
         found.append(
-            KeyCandidate(
-                table.name,
-                (col.name,),
-                score,
-                stats[0],
-                stats[2],
-                tuple([*reasons, "the table already declares a primary key; this is an "
-                       "additional candidate key, not a replacement"]),
-            )
+            KeyCandidate(table.name, (col.name,), score, stats[0], stats[2], (*reasons, *note))
         )
-    if found:
-        found.sort(key=lambda k: (-k.score, k.columns))
-        profile.additional[table.name] = found
+    return None, found, whole_table_seen
 
 
 def _profile_table(
@@ -374,36 +396,16 @@ def _profile_table(
         profile.not_evaluated[table.name] = "no column of a type suitable for a key"
         return
 
-    # 1. Screen on a sample: a duplicate or NULL here is conclusive.
-    sample = probe.column_stats(table.name, [c.name for _, c in usable], sample=True)
-    if sample is None:
-        profile.not_evaluated[table.name] = "probe declined (budget spent or query failed)"
+    stopped, found, whole_table_seen = _unique_single_columns(
+        table, probe, usable, references, table_names
+    )
+    if stopped is not None:
+        profile.not_evaluated[table.name] = {
+            "screen": "probe declined (budget spent or query failed)",
+            "empty": "empty table",
+            "confirm": "probe declined during confirmation",
+        }[stopped]
         return
-    sampled_rows = next(iter(sample.values()))[0] if sample else 0
-    if sampled_rows == 0:
-        profile.not_evaluated[table.name] = "empty table"
-        return
-    survivors = [(i, c) for i, c in usable if _is_unique_non_null(sample[c.name])]
-
-    # 2. Confirm over the whole table, unless the sample already was the whole table.
-    whole_table_seen = sampled_rows < probe.limit
-    exact: dict[str, ColumnStats] = sample
-    if survivors and not whole_table_seen:
-        confirmed = probe.column_stats(table.name, [c.name for _, c in survivors], sample=False)
-        if confirmed is None:
-            profile.not_evaluated[table.name] = "probe declined during confirmation"
-            return
-        exact = confirmed
-
-    found: list[KeyCandidate] = []
-    for position, col in survivors:
-        stats = exact[col.name]
-        if not _is_unique_non_null(stats):
-            continue  # unique in the sample only
-        score, reasons = _score_single(table, col, position, stats[0], references, table_names)
-        found.append(
-            KeyCandidate(table.name, (col.name,), score, stats[0], stats[2], tuple(reasons))
-        )
 
     # 3. Composite keys, only when no single column qualifies.
     if not found:
@@ -495,7 +497,7 @@ def draft_key_overlay(
        draft that would not load is a bug here, never a surprise for the reviewer.
     """
     from .fk_inference import InferenceOptions, infer_foreign_keys
-    from .overlay import apply_key_overlay
+    from .overlay import SUPPORTED_OVERLAY_VERSION, apply_key_overlay
 
     profile = profile_primary_keys(schema, probe, tables=tables, max_pair_checks=max_pair_checks)
     draft = DraftOverlay(overlay={})
@@ -556,7 +558,7 @@ def draft_key_overlay(
     keyed = apply_key_overlay(
         schema,
         {
-            "version": 1,
+            "version": SUPPORTED_OVERLAY_VERSION,
             "tables": {
                 t: {k: v for k, v in spec.items() if k in _KEY_FIELDS}
                 for t, spec in specs.items()
@@ -585,7 +587,7 @@ def draft_key_overlay(
         )
 
     draft.overlay = {
-        "version": 1,
+        "version": SUPPORTED_OVERLAY_VERSION,
         "description": (
             "DRAFT key overlay proposed from data by relational-schema-analyzer -- review "
             "before use. Every key here is a proposal: delete what is wrong, add what was "

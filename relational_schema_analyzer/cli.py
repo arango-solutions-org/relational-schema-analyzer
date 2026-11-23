@@ -23,7 +23,7 @@ from typing import Any
 
 from . import __version__
 from .analyzer import RelationalSchemaAnalyzer
-from .connectors import create_connector
+from .connectors import SUPPORTED_SOURCE_TYPES, create_connector
 from .r2rml_export import (
     DEFAULT_R2RML_DATA_IRI,
     DEFAULT_R2RML_MAPPING_IRI,
@@ -42,8 +42,12 @@ from .types import PhysicalSchema
 
 
 def _add_source_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--source", help="Source type: postgresql | mysql | sqlserver | snowflake | csv")
-    p.add_argument("--url", help="Connection string / DSN (or CSV directory path)")
+    p.add_argument("--source", help="Source type: " + " | ".join(SUPPORTED_SOURCE_TYPES))
+    p.add_argument(
+        "--url",
+        help="Connection string / DSN, or a path for file sources "
+        "(CSV directory, DuckDB / SQLite database, dbt manifest, OSI file)",
+    )
     p.add_argument(
         "--schema",
         default="public",

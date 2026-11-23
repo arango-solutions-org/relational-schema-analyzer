@@ -118,35 +118,6 @@ def annotate_partition_metadata(
                 parent.foreign_keys.append(fk)
 
 
-def preview_table_rows(
-    connection_string: str,
-    schema_name: str,
-    table_name: str,
-    limit: int,
-) -> list[dict]:
-    """Return up to ``limit`` rows from ``schema_name.table_name`` as JSON-safe dicts.
-
-    Both identifiers are bound through psycopg's ``sql.Identifier`` so they are
-    never string-interpolated into SQL. Callers MUST still validate
-    ``table_name`` against a trusted schema snapshot first — this guards against
-    quoting bugs, not against previewing an arbitrary table. Shared by the UI
-    and MCP preview endpoints.
-    """
-    from psycopg import sql
-
-    from .base import serialize_rows
-
-    query = sql.SQL("SELECT * FROM {}.{} LIMIT %s").format(
-        sql.Identifier(schema_name),
-        sql.Identifier(table_name),
-    )
-    with psycopg.connect(connection_string, row_factory=dict_row) as conn:
-        with conn.cursor() as cur:
-            cur.execute(query, (limit,))
-            rows = cur.fetchall()
-    return serialize_rows(rows)
-
-
 class PostgresConnector:
     def __init__(
         self,

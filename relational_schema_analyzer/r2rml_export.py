@@ -38,15 +38,16 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .exports import export_bundle
 from .owl_export import (
     DEFAULT_OWL_BASE_IRI,
     _JSON_TO_XSD,
-    _as_bundle,
     _column_for,
     _datatype_local,
     _sanitize_iri_local,
     _ttl_escape,
 )
+from .quoting import quote_ansi
 
 R2RML_NAMESPACE = "http://www.w3.org/ns/r2rml#"
 DEFAULT_R2RML_DATA_IRI = "http://arangodb.com/data/"
@@ -56,9 +57,12 @@ DEFAULT_R2RML_MAPPING_IRI = "http://arangodb.com/mapping/r2rml#"
 _PLAIN_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def _delimit(name: str) -> str:
-    """SQL-delimited identifier (doubling any embedded quote)."""
-    return '"' + name.replace('"', '""') + '"'
+_delimit = quote_ansi  # SQL-delimited identifier, doubling any embedded quote
+
+
+def _strings(value: Any) -> list[str]:
+    """The string items of a bundle list; anything else in the bundle gives ``[]``."""
+    return [c for c in value if isinstance(c, str)] if isinstance(value, list) else []
 
 
 def _sql_column(name: str) -> str:
@@ -211,7 +215,7 @@ def export_r2rml_turtle(
     ``base_iri`` must match the OWL export's for the mapping to populate that
     ontology; the defaults already agree.
     """
-    data = _as_bundle(analysis)
+    data = export_bundle(analysis)
     cs = data.get("conceptualSchema") or {}
     pm = data.get("physicalMapping") or {}
     entities = cs.get("entities") or []
@@ -241,8 +245,7 @@ def export_r2rml_turtle(
         mapping = pm_entities.get(e["name"]) if isinstance(pm_entities, dict) else None
         if not isinstance(mapping, dict) or not mapping.get("tableName"):
             continue
-        pk = mapping.get("primaryKey")
-        emitted[e["name"]] = [c for c in pk if isinstance(c, str)] if isinstance(pk, list) else []
+        emitted[e["name"]] = _strings(mapping.get("primaryKey"))
 
     # ── One TriplesMap per entity ─────────────────────────────────────
     for e in entities:
@@ -288,8 +291,8 @@ def export_r2rml_turtle(
             target = r.get("toEntity")
             if not isinstance(target, str) or target not in emitted:
                 continue
-            child = [c for c in (rel_map.get("fromColumns") or []) if isinstance(c, str)]
-            parent = [c for c in (rel_map.get("toColumns") or []) if isinstance(c, str)]
+            child = _strings(rel_map.get("fromColumns"))
+            parent = _strings(rel_map.get("toColumns"))
             block.extend(
                 _reference_pom_lines(
                     predicate=f":{_sanitize_iri_local(rel_type)}",
@@ -324,7 +327,7 @@ def export_r2rml_turtle(
 
         # The subject is the *from* entity, addressed through the join table's
         # own FK columns — the standard R2RML idiom for an association table.
-        child_from = [c for c in (rel_map.get("joinFromColumns") or []) if isinstance(c, str)]
+        child_from = _strings(rel_map.get("joinFromColumns"))
         if not child_from:
             continue
         block = [f"{_triples_map_iri(rel_type)}_Link a rr:TriplesMap ;"]
@@ -343,17 +346,13 @@ def export_r2rml_turtle(
             _reference_pom_lines(
                 predicate=f":{_sanitize_iri_local(rel_type)}",
                 parent_map=_triples_map_iri(to_e),
-                child_columns=[
-                    c for c in (rel_map.get("joinToColumns") or []) if isinstance(c, str)
-                ],
-                parent_columns=[
-                    c for c in (rel_map.get("joinToParentColumns") or []) if isinstance(c, str)
-                ],
+                child_columns=_strings(rel_map.get("joinToColumns")),
+                parent_columns=_strings(rel_map.get("joinToParentColumns")),
             )
         )
         _close_block(block)
 
-        dropped = [c for c in (rel_map.get("attributeColumns") or []) if isinstance(c, str)]
+        dropped = _strings(rel_map.get("attributeColumns"))
         if dropped:
             block.append(
                 "# NOTE: R2RML cannot attach properties to a relationship; "

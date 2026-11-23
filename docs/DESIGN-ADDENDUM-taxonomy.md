@@ -30,7 +30,7 @@ Recorded so the ASA work is a port rather than a parallel invention:
 | FK inference — name heuristics, type compatibility, composite candidates, bounded value-overlap sampling, confidence, dedup | `fk_inference.py` (1,539 lines) | New `FOREIGN_KEY` detector |
 | `FOREIGN_KEY` relationship mapping style | `baseline.py:290-299` | Same name adopted in ASA |
 | `JOIN_TABLE` style + `joinFromColumns` / `joinToColumns` / `attributeColumns` | `baseline.py:245-264` | Same name adopted in ASA |
-| Join-table classification heuristic | `heuristics.py::is_likely_join_table`, refined in `baseline.py::_is_join_table` | ASA reification detector |
+| Join-table classification heuristic | `baseline.py::_is_join_table` | ASA reification detector |
 | "Unenforced FK is evidence, not proof" | commit `08be3fb` | Universal on the Arango side — nothing is ever enforced |
 
 **Consequence for RSA: none, immediately.** These are ASA-side ports. The one thing to be

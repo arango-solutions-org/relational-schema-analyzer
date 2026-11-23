@@ -57,6 +57,7 @@ from ..bitemporal import CATALOG
 from ..bitemporal import to_iso as _iso
 from ..check_enum import enrich_check_constraint, parse_mysql_enum_type
 from ..log import get_logger
+from ..quoting import quote_backtick
 from ..types import CheckConstraint, Column, Schema, SourceProvenance, Table
 from .base import group_foreign_keys, mark_one_to_one, unique_columns
 
@@ -90,9 +91,7 @@ def _load_pymysql() -> Any:
     return pymysql
 
 
-def _quote_ident(name: str) -> str:
-    """Backtick-quote a MySQL identifier, escaping embedded backticks."""
-    return "`" + name.replace("`", "``") + "`"
+_quote_ident = quote_backtick  # ```name```, doubling a backtick
 
 
 def _parse_mysql_url(url: str) -> dict[str, Any]:

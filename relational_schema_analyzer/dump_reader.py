@@ -7,7 +7,7 @@ extra (``polars``).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Generator, Iterator
+from typing import Any, Dict, Generator
 
 import polars as pl
 
@@ -45,18 +45,6 @@ class DumpReader:
             return int(lf.select(pl.len()).collect().item())
         except Exception as e:
             logger.error("error_counting_rows", path=str(self.file_path), error=str(e))
-            raise
-
-    def read_chunks(self, chunk_size: int) -> Iterator[pl.DataFrame]:
-        if chunk_size <= 0:
-            raise ValueError("chunk_size must be positive")
-        if not self.file_path.exists():
-            raise FileNotFoundError(f"Dump file not found: {self.file_path}")
-        try:
-            lf = pl.scan_csv(self._csv_path(), **self._polars_csv_kwargs())
-            yield from lf.collect_batches(chunk_size=chunk_size)
-        except Exception as e:
-            logger.error("error_reading_chunks", path=str(self.file_path), error=str(e))
             raise
 
     def read_rows(self) -> Generator[Dict[str, Any], None, None]:
