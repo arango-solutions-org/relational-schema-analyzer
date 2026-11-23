@@ -132,3 +132,55 @@ class TestJsonLd:
         g = rdflib.Graph()
         g.parse(data=json.dumps(doc), format="json-ld")
         assert len(g) > 0
+
+
+class TestJsonLdStatesWhatTurtleStates:
+    """Both formats render one model, so they state the same facts (#53).
+
+    JSON-LD used to walk the bundle separately and dropped a join table's parent columns
+    and a relationship's schema, which Turtle had. Resources are compared by local name:
+    JSON-LD ``@id`` values are relative and resolve against the document rather than the
+    base IRI (#63). Tighten this to full IRIs when that is fixed.
+    """
+
+    _VOCABULARIES = (OWL, RDFS, PHYS, str(rdflib.RDF), str(rdflib.XSD))
+
+    @classmethod
+    def _facts(cls, graph) -> set:
+        def norm(term):
+            if isinstance(term, rdflib.URIRef) and not str(term).startswith(cls._VOCABULARIES):
+                return str(term).rsplit("#", 1)[-1].rsplit("/", 1)[-1]
+            return term
+
+        header = {
+            s
+            for s, _, o in graph.triples((None, rdflib.RDF.type, None))
+            if o in (rdflib.OWL.Ontology, rdflib.OWL.AnnotationProperty)
+        }
+        return {tuple(norm(t) for t in triple) for triple in graph if triple[0] not in header}
+
+    def _both(self, schema):
+        import json
+
+        analysis = RelationalSchemaAnalyzer().analyze(schema)
+        jsonld = rdflib.Graph().parse(data=json.dumps(export_owl_jsonld(analysis)), format="json-ld")
+        return self._facts(_graph(export_owl_turtle(analysis))), self._facts(jsonld)
+
+    @pytest.mark.parametrize("schema", [_basic_schema, _join_schema], ids=["fk", "join"])
+    def test_the_same_facts(self, schema):
+        built = schema()
+        for table in built.tables.values():
+            table.schema_name = "school"  # so relationships carry phys:schemaName
+        turtle, jsonld = self._both(built)
+        assert turtle - jsonld == set(), "facts only Turtle states"
+        assert jsonld - turtle == set(), "facts only JSON-LD states"
+
+    def test_the_join_table_annotations_jsonld_used_to_drop(self):
+        built = _join_schema()
+        for table in built.tables.values():
+            table.schema_name = "school"
+        doc = export_owl_jsonld(RelationalSchemaAnalyzer().analyze(built))
+        (rel,) = [n for n in doc["@graph"] if n["@id"] == "Students_Courses"]
+        assert rel["phys:joinFromParentColumns"] == ["id"]
+        assert rel["phys:joinToParentColumns"] == ["id"]
+        assert rel["phys:schemaName"] == "school"

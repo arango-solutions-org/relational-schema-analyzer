@@ -42,6 +42,7 @@ from .owl_export import (
     DEFAULT_OWL_BASE_IRI,
     _JSON_TO_XSD,
     _as_bundle,
+    _column_for,
     _datatype_local,
     _sanitize_iri_local,
     _ttl_escape,
@@ -137,10 +138,7 @@ def _datatype_pom_lines(
     prop_name = prop.get("name")
     if not isinstance(prop_name, str) or not prop_name:
         return []
-    physical = pm_props.get(prop_name) if isinstance(pm_props, dict) else None
-    column = physical.get("field") if isinstance(physical, dict) else None
-    if not isinstance(column, str) or not column:
-        column = prop_name
+    column = _column_for(prop_name, pm_props)
     predicate = f":{_datatype_local(entity_name, prop_name)}"
     return [
         "    rr:predicateObjectMap [",
