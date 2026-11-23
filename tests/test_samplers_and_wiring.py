@@ -216,3 +216,55 @@ def test_discovery_failure_never_fails_the_analysis(monkeypatch):
 
     assert analysis.conceptual.entities, "analysis was lost"
     assert analysis.metadata["taxonomyStatus"]["status"] == "degraded"
+
+
+# ── dialects and bounds (#56) ────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "source_type, enumerate_sql, parent_sample",
+    [
+        (None, 'SELECT DISTINCT "c" FROM "s"."t" WHERE "c" IS NOT NULL LIMIT 9',
+         'FROM (SELECT "id" FROM "s"."p" LIMIT 100) p'),
+        ("postgresql", 'SELECT DISTINCT "c" FROM "s"."t" WHERE "c" IS NOT NULL LIMIT 9',
+         'FROM (SELECT "id" FROM "s"."p" LIMIT 100) p'),
+        # MySQL without ANSI_QUOTES reads "c" as a string, so it needs backticks.
+        ("mysql", "SELECT DISTINCT `c` FROM `s`.`t` WHERE `c` IS NOT NULL LIMIT 9",
+         "FROM (SELECT `id` FROM `s`.`p` LIMIT 100) p"),
+        ("mariadb", "SELECT DISTINCT `c` FROM `s`.`t` WHERE `c` IS NOT NULL LIMIT 9",
+         "FROM (SELECT `id` FROM `s`.`p` LIMIT 100) p"),
+        ("databricks", "SELECT DISTINCT `c` FROM `s`.`t` WHERE `c` IS NOT NULL LIMIT 9",
+         "FROM (SELECT `id` FROM `s`.`p` LIMIT 100) p"),
+        # SQL Server has no LIMIT.
+        ("sqlserver", "SELECT DISTINCT TOP (9) [c] FROM [s].[t] WHERE [c] IS NOT NULL",
+         "FROM (SELECT TOP (100) [id] FROM [s].[p]) p"),
+    ],
+)
+def test_each_dialect_gets_its_own_quoting_and_row_cap(source_type, enumerate_sql, parent_sample):
+    seen: list[str] = []
+    enumerate_values = make_value_enumerator(
+        lambda sql, params: seen.append(sql) or [("x",)], schema="s", source_type=source_type
+    )
+    count = make_specialization_counter(
+        lambda sql, params: seen.append(sql) or [(1, 0, 0)],
+        schema="s", source_type=source_type, limit=100,
+    )
+    enumerate_values("t", "c", 8)
+    count("p", "id", ["child"])
+    assert seen[0] == enumerate_sql
+    assert parent_sample in seen[1]
+
+
+def test_a_failed_query_is_unmeasured_not_retried_unbounded():
+    """The old fallback dropped the row cap and read the whole column."""
+    calls: list[str] = []
+    enumerate_values = make_value_enumerator(lambda sql, params: calls.append(sql) or None)
+    assert enumerate_values("t", "c", 8) is None
+    assert calls == ['SELECT DISTINCT "c" FROM "t" WHERE "c" IS NOT NULL LIMIT 9']
+
+
+def test_counter_reads_a_bounded_sample_of_parent_rows(db):
+    counts = make_specialization_counter(executor_from_connection(db), limit=3)(
+        "account", "account_id", list(SUBTYPES)
+    )
+    assert counts["total"] == 3, "the parent table holds 8 rows; only 3 may be read"
