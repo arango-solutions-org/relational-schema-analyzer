@@ -24,6 +24,7 @@ are overridable via the ``base_iri`` / ``phys_iri`` arguments (CLI ``--iri-base`
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 from typing import Any
 
 DEFAULT_OWL_BASE_IRI = "http://arangodb.com/schema/relational#"
@@ -124,6 +125,191 @@ def _subclass_map(cs: dict[str, Any]) -> dict[str, list[str]]:
     return out
 
 
+def _column_for(prop_name: str, pm_props: Any) -> str:
+    """The source column behind a property: its mapping's ``field``, else its own name.
+
+    Shared with ``r2rml_export`` so the OWL ``phys:columnName`` and the R2RML
+    ``rr:column`` cannot name different columns.
+    """
+    physical = pm_props.get(prop_name) if isinstance(pm_props, dict) else None
+    column = physical.get("field") if isinstance(physical, dict) else None
+    return column if isinstance(column, str) and column else prop_name
+
+
+# ── One model, two serializations ───────────────────────────────────────
+#
+# Turtle and JSON-LD used to walk the bundle separately, and JSON-LD drifted: it dropped
+# the join tables' parent columns and the relationships' schema (#53). Both now render
+# the same nodes, so a fact can only be missing from both.
+
+
+@dataclass
+class _Iri:
+    """A resource: ``:Local`` in this ontology, or a prefixed name such as ``xsd:string``."""
+
+    ref: str
+
+
+@dataclass
+class _Node:
+    """One OWL resource, independent of serialization.
+
+    ``head`` is what Turtle writes inside the resource's predicate list (domain, range);
+    ``statements`` are written as separate triples, in order. A statement's value is an
+    :class:`_Iri`, a literal string, or a list of literals (always a JSON-LD array, even
+    with one element). A predicate repeated with single values becomes a JSON-LD array
+    only when it repeats, as ``rdfs:subClassOf`` does for a class with several parents.
+    """
+
+    local: str
+    types: str | list[str]  # a string stays a JSON-LD scalar (owl:Class)
+    label: str
+    head: list[tuple[str, _Iri]] = field(default_factory=list)
+    statements: list[tuple[str, Any]] = field(default_factory=list)
+
+    def literal(self, predicate: str, value: Any) -> None:
+        if value:
+            self.statements.append((predicate, str(value)))
+
+
+def _owl_model(data: dict[str, Any]) -> tuple[list[tuple[_Node, list[_Node]]], list[_Node]]:
+    """``([(class, [its datatype properties]), ...], [object properties])``."""
+    cs = data.get("conceptualSchema") or {}
+    pm = data.get("physicalMapping") or {}
+    superclasses = _subclass_map(cs)
+    pm_entities: dict[str, Any] = pm["entities"] if isinstance(pm.get("entities"), dict) else {}
+    pm_rels: dict[str, Any] = (
+        pm["relationships"] if isinstance(pm.get("relationships"), dict) else {}
+    )
+
+    classes: list[tuple[_Node, list[_Node]]] = []
+    for e in cs.get("entities") or []:
+        if not isinstance(e, dict) or not isinstance(e.get("name"), str) or not e["name"]:
+            continue
+        name = e["name"]
+        node = _Node(_sanitize_iri_local(name), "owl:Class", name)
+        for superclass in superclasses.get(name, []):
+            node.statements.append(("rdfs:subClassOf", _Iri(f":{_sanitize_iri_local(superclass)}")))
+        mapping = pm_entities.get(name)
+        if isinstance(mapping, dict):
+            node.literal("phys:mappingStyle", mapping.get("style"))
+            node.literal("phys:tableName", mapping.get("tableName"))
+            node.literal("phys:schemaName", mapping.get("schema"))
+        pm_props = mapping.get("properties") if isinstance(mapping, dict) else {}
+        table_name = mapping.get("tableName") if isinstance(mapping, dict) else None
+        props = [
+            _datatype_property_node(name, node.local, prop, pm_props, table_name)
+            for prop in e.get("properties") or []
+            if isinstance(prop, dict) and isinstance(prop.get("name"), str)
+        ]
+        classes.append((node, props))
+
+    relationships = [
+        _object_property_node(r, pm_rels.get(r["type"]))
+        for r in cs.get("relationships") or []
+        if isinstance(r, dict) and isinstance(r.get("type"), str) and r["type"]
+    ]
+    return classes, relationships
+
+
+def _datatype_property_node(
+    entity_name: str, entity_local: str, prop: dict[str, Any], pm_props: Any, table_name: Any
+) -> _Node:
+    pname = prop["name"]
+    types = ["owl:DatatypeProperty"]
+    if prop.get("unique"):
+        types += ["owl:FunctionalProperty", "owl:InverseFunctionalProperty"]
+    node = _Node(
+        _datatype_local(entity_name, pname),
+        types,
+        pname,
+        head=[
+            ("rdfs:domain", _Iri(f":{entity_local}")),
+            ("rdfs:range", _Iri(_JSON_TO_XSD.get(str(prop.get("type")), "xsd:string"))),
+        ],
+    )
+    node.statements.append(("phys:columnName", _column_for(pname, pm_props)))
+    node.literal("phys:tableName", table_name)
+    return node
+
+
+def _object_property_node(r: dict[str, Any], mapping: Any) -> _Node:
+    rtype = r["type"]
+    cardinality = r.get("cardinality")
+    functional, inverse_functional = _cardinality_characteristics(
+        cardinality if isinstance(cardinality, str) else None
+    )
+    types = ["owl:ObjectProperty"]
+    if functional:
+        types.append("owl:FunctionalProperty")
+    if inverse_functional:
+        types.append("owl:InverseFunctionalProperty")
+
+    node = _Node(_sanitize_iri_local(rtype), types, rtype)
+    for predicate, key in (("rdfs:domain", "fromEntity"), ("rdfs:range", "toEntity")):
+        if isinstance(r.get(key), str) and r[key]:
+            node.head.append((predicate, _Iri(f":{_sanitize_iri_local(r[key])}")))
+    if isinstance(cardinality, str):
+        node.literal("phys:observedCardinality", cardinality)
+    if isinstance(r.get("inverseOf"), str) and r["inverseOf"]:
+        node.statements.append(("owl:inverseOf", _Iri(f":{_sanitize_iri_local(r['inverseOf'])}")))
+
+    if isinstance(mapping, dict):
+        node.literal("phys:mappingStyle", mapping.get("style"))
+        node.literal("phys:joinTable", mapping.get("joinTable"))
+        node.literal("phys:tableName", mapping.get("fromTable"))
+        node.literal("phys:schemaName", mapping.get("schema"))
+        for key in (
+            "fromColumns",
+            "toColumns",
+            "joinFromColumns",
+            "joinFromParentColumns",
+            "joinToColumns",
+            "joinToParentColumns",
+        ):
+            if isinstance(mapping.get(key), list):
+                node.statements.append((f"phys:{key}", [str(c) for c in mapping[key]]))
+    return node
+
+
+def _turtle_node(node: _Node) -> list[str]:
+    iri = f":{node.local}"
+    types = node.types if isinstance(node.types, str) else ", ".join(node.types)
+    out = [f"{iri} a {types} ;", f'  rdfs:label "{_ttl_escape(node.label)}" ;']
+    out += [f"  {predicate} {value.ref} ;" for predicate, value in node.head]
+    out[-1] = out[-1][: -len(" ;")] + " ."  # close the predicate list
+    for predicate, value in node.statements:
+        if isinstance(value, _Iri):
+            out.append(f"{iri} {predicate} {value.ref} .")
+        elif isinstance(value, list):
+            out += [f'{iri} {predicate} "{_ttl_escape(v)}" .' for v in value]
+        else:
+            out.append(f'{iri} {predicate} "{_ttl_escape(value)}" .')
+    out.append("")
+    return out
+
+
+def _jsonld_value(value: Any) -> Any:
+    if isinstance(value, _Iri):
+        return {"@id": value.ref[1:] if value.ref.startswith(":") else value.ref}
+    return list(value) if isinstance(value, list) else value
+
+
+def _jsonld_node(node: _Node) -> dict[str, Any]:
+    out: dict[str, Any] = {"@id": node.local, "@type": node.types, "rdfs:label": node.label}
+    for predicate, value in node.head:
+        out[predicate] = _jsonld_value(value)
+    grouped: dict[str, list[Any]] = {}
+    for predicate, value in node.statements:
+        grouped.setdefault(predicate, []).append(value)
+    for predicate, values in grouped.items():
+        if len(values) == 1:
+            out[predicate] = _jsonld_value(values[0])
+        else:
+            out[predicate] = [_jsonld_value(v) for v in values]
+    return out
+
+
 def export_owl_turtle(
     analysis: Any,
     *,
@@ -131,15 +317,7 @@ def export_owl_turtle(
     phys_iri: str = DEFAULT_OWL_PHYSICAL_IRI,
 ) -> str:
     """Serialize the conceptual schema + physical mapping to OWL Turtle."""
-    data = _as_bundle(analysis)
-    cs = data.get("conceptualSchema") or {}
-    pm = data.get("physicalMapping") or {}
-    entities = cs.get("entities") or []
-    superclasses = _subclass_map(cs)
-    rels = cs.get("relationships") or []
-    pm_entities = pm.get("entities") if isinstance(pm.get("entities"), dict) else {}
-    pm_rels = pm.get("relationships") if isinstance(pm.get("relationships"), dict) else {}
-
+    classes, relationships = _owl_model(_as_bundle(analysis))
     lines: list[str] = [
         f"@prefix : <{base_iri}> .",
         "@prefix owl: <http://www.w3.org/2002/07/owl#> .",
@@ -153,151 +331,17 @@ def export_owl_turtle(
         '  rdfs:comment "Conceptual schema inferred from a relational physical schema." .',
         "",
     ]
-    for ap in _PHYS_ANNOTATION_PROPERTIES:
-        lines.append(f"phys:{ap} a owl:AnnotationProperty .")
+    lines += [f"phys:{ap} a owl:AnnotationProperty ." for ap in _PHYS_ANNOTATION_PROPERTIES]
     lines.append("")
-
-    # ── Classes + datatype properties ─────────────────────────────────
-    datatype_props: list[str] = []
-    for e in entities:
-        if not isinstance(e, dict) or not isinstance(e.get("name"), str) or not e["name"]:
-            continue
-        name = e["name"]
-        iri = f":{_sanitize_iri_local(name)}"
-        lines.append(f"{iri} a owl:Class ;")
-        lines.append(f'  rdfs:label "{_ttl_escape(name)}" .')
-        for superclass in superclasses.get(name, []):
-            lines.append(f"{iri} rdfs:subClassOf :{_sanitize_iri_local(superclass)} .")
-
-        mapping = pm_entities.get(name) if isinstance(pm_entities, dict) else None
-        pm_props = mapping.get("properties") if isinstance(mapping, dict) else {}
-        if isinstance(mapping, dict):
-            if mapping.get("style"):
-                lines.append(f'{iri} phys:mappingStyle "{_ttl_escape(str(mapping["style"]))}" .')
-            if mapping.get("tableName"):
-                lines.append(f'{iri} phys:tableName "{_ttl_escape(str(mapping["tableName"]))}" .')
-            if mapping.get("schema"):
-                lines.append(f'{iri} phys:schemaName "{_ttl_escape(str(mapping["schema"]))}" .')
-        lines.append("")
-
-        for prop in e.get("properties") or []:
-            if not isinstance(prop, dict) or not isinstance(prop.get("name"), str):
-                continue
-            datatype_props.extend(
-                _datatype_property_lines(
-                    entity_name=name,
-                    entity_iri=iri,
-                    prop=prop,
-                    pm_props=pm_props if isinstance(pm_props, dict) else {},
-                    table_name=mapping.get("tableName") if isinstance(mapping, dict) else None,
-                )
-            )
-
-    lines.extend(datatype_props)
-
-    # ── Object properties (relationships) ─────────────────────────────
-    for r in rels:
-        if not isinstance(r, dict) or not isinstance(r.get("type"), str) or not r["type"]:
-            continue
-        lines.extend(
-            _object_property_lines(
-                r,
-                pm_rels.get(r["type"]) if isinstance(pm_rels, dict) else None,
-            )
-        )
-
+    # Every class first, then every datatype property, then the object properties.
+    for cls, _ in classes:
+        lines += _turtle_node(cls)
+    for _, props in classes:
+        for prop in props:
+            lines += _turtle_node(prop)
+    for rel in relationships:
+        lines += _turtle_node(rel)
     return "\n".join(lines).rstrip() + "\n"
-
-
-def _datatype_property_lines(
-    *,
-    entity_name: str,
-    entity_iri: str,
-    prop: dict[str, Any],
-    pm_props: dict[str, Any],
-    table_name: str | None,
-) -> list[str]:
-    pname = prop["name"]
-    local = _datatype_local(entity_name, pname)
-    iri = f":{local}"
-    xsd = _JSON_TO_XSD.get(str(prop.get("type")), "xsd:string")
-    is_key = bool(prop.get("unique"))
-
-    types = ["owl:DatatypeProperty"]
-    if is_key:
-        types += ["owl:FunctionalProperty", "owl:InverseFunctionalProperty"]
-
-    out = [
-        f"{iri} a {', '.join(types)} ;",
-        f'  rdfs:label "{_ttl_escape(pname)}" ;',
-        f"  rdfs:domain {entity_iri} ;",
-        f"  rdfs:range {xsd} .",
-    ]
-    field = None
-    pm_prop = pm_props.get(pname) if isinstance(pm_props, dict) else None
-    if isinstance(pm_prop, dict):
-        field = pm_prop.get("field")
-    column = field if isinstance(field, str) and field else pname
-    out.append(f'{iri} phys:columnName "{_ttl_escape(column)}" .')
-    if table_name:
-        out.append(f'{iri} phys:tableName "{_ttl_escape(str(table_name))}" .')
-    out.append("")
-    return out
-
-
-def _object_property_lines(r: dict[str, Any], mapping: dict[str, Any] | None) -> list[str]:
-    rtype = r["type"]
-    iri = f":{_sanitize_iri_local(rtype)}"
-    from_e = r.get("fromEntity")
-    to_e = r.get("toEntity")
-    cardinality = r.get("cardinality")
-    functional, inverse_functional = _cardinality_characteristics(
-        cardinality if isinstance(cardinality, str) else None
-    )
-
-    types = ["owl:ObjectProperty"]
-    if functional:
-        types.append("owl:FunctionalProperty")
-    if inverse_functional:
-        types.append("owl:InverseFunctionalProperty")
-
-    out = [f"{iri} a {', '.join(types)} ;", f'  rdfs:label "{_ttl_escape(rtype)}" ;']
-    if isinstance(from_e, str) and from_e:
-        out.append(f"  rdfs:domain :{_sanitize_iri_local(from_e)} ;")
-    if isinstance(to_e, str) and to_e:
-        out.append(f"  rdfs:range :{_sanitize_iri_local(to_e)} ;")
-    # Close the predicate-list block.
-    out[-1] = out[-1].rstrip(" ;") + " ."
-
-    if isinstance(cardinality, str) and cardinality:
-        out.append(f'{iri} phys:observedCardinality "{_ttl_escape(cardinality)}" .')
-    if isinstance(r.get("inverseOf"), str) and r["inverseOf"]:
-        out.append(f"{iri} owl:inverseOf :{_sanitize_iri_local(r['inverseOf'])} .")
-
-    if isinstance(mapping, dict):
-        if mapping.get("style"):
-            out.append(f'{iri} phys:mappingStyle "{_ttl_escape(str(mapping["style"]))}" .')
-        for key, phys in (("joinTable", "joinTable"),):
-            if mapping.get(key):
-                out.append(f'{iri} phys:{phys} "{_ttl_escape(str(mapping[key]))}" .')
-        if mapping.get("fromTable"):
-            out.append(f'{iri} phys:tableName "{_ttl_escape(str(mapping["fromTable"]))}" .')
-        if mapping.get("schema"):
-            out.append(f'{iri} phys:schemaName "{_ttl_escape(str(mapping["schema"]))}" .')
-        for key, phys in (
-            ("fromColumns", "fromColumns"),
-            ("toColumns", "toColumns"),
-            ("joinFromColumns", "joinFromColumns"),
-            ("joinFromParentColumns", "joinFromParentColumns"),
-            ("joinToColumns", "joinToColumns"),
-            ("joinToParentColumns", "joinToParentColumns"),
-        ):
-            value = mapping.get(key)
-            if isinstance(value, list):
-                for col in value:
-                    out.append(f'{iri} phys:{phys} "{_ttl_escape(str(col))}" .')
-    out.append("")
-    return out
 
 
 def export_owl_jsonld(
@@ -307,100 +351,12 @@ def export_owl_jsonld(
     phys_iri: str = DEFAULT_OWL_PHYSICAL_IRI,
 ) -> dict[str, Any]:
     """JSON-LD serialization of the same OWL conceptual model as the Turtle export."""
-    data = _as_bundle(analysis)
-    cs = data.get("conceptualSchema") or {}
-    pm = data.get("physicalMapping") or {}
-    entities = cs.get("entities") or []
-    superclasses = _subclass_map(cs)
-    rels = cs.get("relationships") or []
-    pm_entities = pm.get("entities") if isinstance(pm.get("entities"), dict) else {}
-    pm_rels = pm.get("relationships") if isinstance(pm.get("relationships"), dict) else {}
-
+    classes, relationships = _owl_model(_as_bundle(analysis))
     graph: list[dict[str, Any]] = []
-
-    for e in entities:
-        if not isinstance(e, dict) or not isinstance(e.get("name"), str) or not e["name"]:
-            continue
-        name = e["name"]
-        node: dict[str, Any] = {
-            "@id": _sanitize_iri_local(name),
-            "@type": "owl:Class",
-            "rdfs:label": name,
-        }
-        supers = superclasses.get(name, [])
-        if len(supers) == 1:
-            node["rdfs:subClassOf"] = {"@id": _sanitize_iri_local(supers[0])}
-        elif supers:
-            node["rdfs:subClassOf"] = [{"@id": _sanitize_iri_local(s)} for s in supers]
-        mapping = pm_entities.get(name) if isinstance(pm_entities, dict) else None
-        if isinstance(mapping, dict):
-            if mapping.get("style"):
-                node["phys:mappingStyle"] = str(mapping["style"])
-            if mapping.get("tableName"):
-                node["phys:tableName"] = str(mapping["tableName"])
-            if mapping.get("schema"):
-                node["phys:schemaName"] = str(mapping["schema"])
-        graph.append(node)
-
-        pm_props = mapping.get("properties") if isinstance(mapping, dict) else {}
-        for prop in e.get("properties") or []:
-            if not isinstance(prop, dict) or not isinstance(prop.get("name"), str):
-                continue
-            pname = prop["name"]
-            types = ["owl:DatatypeProperty"]
-            if prop.get("unique"):
-                types += ["owl:FunctionalProperty", "owl:InverseFunctionalProperty"]
-            dnode: dict[str, Any] = {
-                "@id": _datatype_local(name, pname),
-                "@type": types,
-                "rdfs:label": pname,
-                "rdfs:domain": {"@id": _sanitize_iri_local(name)},
-                "rdfs:range": {"@id": _JSON_TO_XSD.get(str(prop.get("type")), "xsd:string")},
-            }
-            field = None
-            if isinstance(pm_props, dict) and isinstance(pm_props.get(pname), dict):
-                field = pm_props[pname].get("field")
-            dnode["phys:columnName"] = field if isinstance(field, str) and field else pname
-            if isinstance(mapping, dict) and mapping.get("tableName"):
-                dnode["phys:tableName"] = str(mapping["tableName"])
-            graph.append(dnode)
-
-    for r in rels:
-        if not isinstance(r, dict) or not isinstance(r.get("type"), str) or not r["type"]:
-            continue
-        rtype = r["type"]
-        cardinality = r.get("cardinality")
-        functional, inverse_functional = _cardinality_characteristics(
-            cardinality if isinstance(cardinality, str) else None
-        )
-        types = ["owl:ObjectProperty"]
-        if functional:
-            types.append("owl:FunctionalProperty")
-        if inverse_functional:
-            types.append("owl:InverseFunctionalProperty")
-        node = {"@id": _sanitize_iri_local(rtype), "@type": types, "rdfs:label": rtype}
-        if isinstance(r.get("fromEntity"), str) and r["fromEntity"]:
-            node["rdfs:domain"] = {"@id": _sanitize_iri_local(r["fromEntity"])}
-        if isinstance(r.get("toEntity"), str) and r["toEntity"]:
-            node["rdfs:range"] = {"@id": _sanitize_iri_local(r["toEntity"])}
-        if isinstance(cardinality, str) and cardinality:
-            node["phys:observedCardinality"] = cardinality
-        if isinstance(r.get("inverseOf"), str) and r["inverseOf"]:
-            node["owl:inverseOf"] = {"@id": _sanitize_iri_local(r["inverseOf"])}
-        mapping = pm_rels.get(rtype) if isinstance(pm_rels, dict) else None
-        if isinstance(mapping, dict):
-            if mapping.get("style"):
-                node["phys:mappingStyle"] = str(mapping["style"])
-            for key in ("joinTable",):
-                if mapping.get(key):
-                    node[f"phys:{key}"] = str(mapping[key])
-            for key in ("fromColumns", "toColumns", "joinFromColumns", "joinToColumns"):
-                if isinstance(mapping.get(key), list):
-                    node[f"phys:{key}"] = [str(c) for c in mapping[key]]
-            if mapping.get("fromTable"):
-                node["phys:tableName"] = str(mapping["fromTable"])
-        graph.append(node)
-
+    for cls, props in classes:
+        graph.append(_jsonld_node(cls))
+        graph += [_jsonld_node(prop) for prop in props]
+    graph += [_jsonld_node(rel) for rel in relationships]
     return {
         "@context": {
             "@vocab": base_iri,
