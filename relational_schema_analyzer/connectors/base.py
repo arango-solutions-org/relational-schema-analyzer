@@ -146,6 +146,15 @@ _MSSQL_ALIASES: frozenset[str] = frozenset({"sqlserver", "mssql", "sql_server"})
 _SQLITE_ALIASES: frozenset[str] = frozenset({"sqlite", "sqlite3"})
 
 
+def quote_identifier(name: str) -> str:
+    """A double-quoted SQL identifier, with any ``"`` inside it doubled.
+
+    The ANSI rule that Postgres and Snowflake follow. Wrapping a name in quotes without
+    doubling breaks the statement for a name that contains ``"`` (#55).
+    """
+    return '"' + name.replace('"', '""') + '"'
+
+
 def merge_unique_sets(
     constraints: list[list[str]],
     indexes: list[list[str]],

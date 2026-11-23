@@ -73,3 +73,29 @@ def test_column_enrichment(snowflake_shop):
     assert status.default is not None
     assert conf._find_col(users, "email").comment == "contact email"
     assert users.comment == "people"
+
+
+def test_names_containing_a_double_quote(tmp_path):
+    """Schema reads and bulk reads double an embedded ``"`` rather than breaking (#55)."""
+    import snowflake.connector as sc
+
+    with fakesnow.patch():
+        conn = sc.connect(database="DB1", schema="PUBLIC")
+        cur = conn.cursor()
+        cur.execute('CREATE TABLE "WE""IRD" (ID INT PRIMARY KEY, "UP""DATED" INT)')
+        cur.execute('INSERT INTO "WE""IRD" VALUES (1, 10), (2, 20), (3, 30)')
+        cur.close()
+        conn.close()
+
+        connector = SnowflakeConnector("snowflake://u:p@acct/DB1/PUBLIC")
+        table = conf._find_table(connector.get_schema(), 'WE"IRD')
+        assert table.primary_key == ["ID"]
+
+        session = connector.open_session()
+        try:
+            assert session.count_rows('WE"IRD') == 3
+            assert session.count_rows('WE"IRD', since_column='UP"DATED', since_value="20") == 2
+            rows = list(session.stream_rows('WE"IRD', since_column='UP"DATED', since_value="30"))
+            assert [r["ID"] for r in rows] == [3]
+        finally:
+            session.close()

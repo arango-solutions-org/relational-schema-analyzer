@@ -63,6 +63,7 @@ from ..bitemporal import CATALOG
 from ..bitemporal import to_iso as _iso
 from ..log import get_logger
 from ..types import Column, ForeignKey, Schema, SourceProvenance, Table
+from .base import quote_identifier
 
 logger = get_logger(__name__)
 
@@ -299,6 +300,10 @@ class SnowflakeConnector:
             )
         return columns
 
+    def _qualified_name(self, table_name: str) -> str:
+        """``"DB"."SCHEMA"."TABLE"`` for a ``SHOW … IN TABLE`` statement."""
+        return ".".join(quote_identifier(n) for n in (self._database, self.schema_name, table_name))
+
     def _fetch_unique_constraints(self, conn: Any, table_name: str) -> list[list[str]]:
         """Return unique-key column sets via ``SHOW UNIQUE KEYS`` (best-effort).
 
@@ -308,7 +313,7 @@ class SnowflakeConnector:
         cur = conn.cursor()
         try:
             cur.execute(
-                f'SHOW UNIQUE KEYS IN TABLE "{self._database}"."{self.schema_name}"."{table_name}"'
+                f"SHOW UNIQUE KEYS IN TABLE {self._qualified_name(table_name)}"
             )
             rows = cur.fetchall()
             columns = [d[0] for d in (cur.description or [])]
@@ -341,7 +346,7 @@ class SnowflakeConnector:
         cur = conn.cursor()
         try:
             cur.execute(
-                f'SHOW PRIMARY KEYS IN TABLE "{self._database}"."{self.schema_name}"."{table_name}"'
+                f"SHOW PRIMARY KEYS IN TABLE {self._qualified_name(table_name)}"
             )
             rows = cur.fetchall()
             columns = [d[0] for d in (cur.description or [])]
@@ -373,7 +378,7 @@ class SnowflakeConnector:
         cur = conn.cursor()
         try:
             cur.execute(
-                f'SHOW IMPORTED KEYS IN TABLE "{self._database}"."{self.schema_name}"."{table_name}"'
+                f"SHOW IMPORTED KEYS IN TABLE {self._qualified_name(table_name)}"
             )
             rows = cur.fetchall()
             columns = [d[0] for d in (cur.description or [])]
@@ -628,7 +633,7 @@ class SnowflakeSession:
         self.close()
 
     def _qualified(self, table: str) -> str:
-        return f'"{self._database}"."{self.schema_name}"."{table}"'
+        return ".".join(quote_identifier(n) for n in (self._database, self.schema_name, table))
 
     def count_rows(
         self,
@@ -643,7 +648,7 @@ class SnowflakeSession:
         try:
             if since_column and since_value is not None:
                 cur.execute(
-                    f'SELECT COUNT(*) FROM {q} WHERE "{since_column}" >= %s',  # noqa: S608
+                    f"SELECT COUNT(*) FROM {q} WHERE {quote_identifier(since_column)} >= %s",  # noqa: S608
                     (since_value,),
                 )
             else:
@@ -674,7 +679,7 @@ class SnowflakeSession:
         try:
             if since_column and since_value is not None:
                 cur.execute(
-                    f'SELECT * FROM {q} WHERE "{since_column}" >= %s',  # noqa: S608
+                    f"SELECT * FROM {q} WHERE {quote_identifier(since_column)} >= %s",  # noqa: S608
                     (since_value,),
                 )
             else:
