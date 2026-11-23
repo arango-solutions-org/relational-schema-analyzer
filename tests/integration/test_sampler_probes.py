@@ -16,6 +16,7 @@ Run with::
     RUN_INTEGRATION=1 \\
       RSA_PG_DSN=postgresql://user:pw@localhost:5432/db \\
       RSA_MYSQL_DSN=mysql://root:@127.0.0.1:3306/rsa_it \\
+      RSA_MSSQL_DSN='mssql://sa:pw@127.0.0.1:1433/rsa_it' \\
       pytest tests/integration/test_sampler_probes.py
 
 Each dialect is independently skipped when its DSN is absent, and each builds and
@@ -87,6 +88,26 @@ _MYSQL_TEARDOWN = [
 ]
 
 
+# SQL Server: tables in the DSN's database, schema dbo. SQL Server was never run live
+# by any test before this dialect was added (#59).
+_MSSQL_DDL = [
+    "DROP TABLE IF EXISTS customers",
+    "DROP TABLE IF EXISTS plans",
+    "DROP TABLE IF EXISTS regions",
+    "CREATE TABLE plans (code NVARCHAR(20) PRIMARY KEY)",
+    "INSERT INTO plans VALUES ('gold'),('silver'),('bronze'),('platinum')",
+    "CREATE TABLE regions (code NVARCHAR(20) PRIMARY KEY)",
+    "INSERT INTO regions VALUES ('EU'),('US')",
+    """CREATE TABLE customers (
+           id INT PRIMARY KEY, name NVARCHAR(50), zip NVARCHAR(10), city NVARCHAR(50),
+           state NVARCHAR(10), tags NVARCHAR(80), plan_code NVARCHAR(20),
+           region_code NVARCHAR(20))""",
+    f"INSERT INTO customers VALUES {_ROWS}",
+]
+
+_MSSQL_TEARDOWN = _MYSQL_TEARDOWN
+
+
 def _pg_setup(dsn: str, statements: list[str]) -> None:
     import psycopg
 
@@ -106,6 +127,20 @@ def _mysql_setup(dsn: str, statements: list[str]) -> None:
                 cur.execute(stmt)
 
 
+def _mssql_setup(dsn: str, statements: list[str]) -> None:
+    from relational_schema_analyzer.connectors.mssql import _parse_mssql_url
+
+    import pymssql
+
+    conn = pymssql.connect(**_parse_mssql_url(dsn), autocommit=True)
+    try:
+        cur = conn.cursor()
+        for stmt in statements:
+            cur.execute(stmt)
+    finally:
+        conn.close()
+
+
 def _pg_sampler(dsn: str):
     from relational_schema_analyzer.fk_inference import PostgresValueSampler
 
@@ -120,6 +155,12 @@ def _mysql_sampler(dsn: str):
     return MySQLValueSampler(dsn, schema_name=database)
 
 
+def _mssql_sampler(dsn: str):
+    from relational_schema_analyzer.fk_inference import SQLServerValueSampler
+
+    return SQLServerValueSampler(dsn, schema_name="dbo")
+
+
 # dialect -> (dsn env var, driver module, setup fn, ddl, teardown, sampler factory)
 _DIALECTS = {
     "postgresql": (
@@ -129,6 +170,10 @@ _DIALECTS = {
     "mysql": (
         "RSA_MYSQL_DSN", "pymysql", _mysql_setup, _MYSQL_DDL,
         _MYSQL_TEARDOWN, _mysql_sampler,
+    ),
+    "sqlserver": (
+        "RSA_MSSQL_DSN", "pymssql", _mssql_setup, _MSSQL_DDL,
+        _MSSQL_TEARDOWN, _mssql_sampler,
     ),
 }
 

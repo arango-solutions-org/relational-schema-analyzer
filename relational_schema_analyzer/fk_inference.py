@@ -94,7 +94,7 @@ way are recorded in ``docs/DESIGN-ADDENDUM-denormalization.md``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Literal, Optional, Sequence, cast
+from typing import Any, Callable, Literal, Optional, Sequence, TypeVar, cast
 
 from pydantic import BaseModel, Field
 
@@ -1244,22 +1244,228 @@ class PostgresValueSampler:
         return self._scalar(q, (self.limit, delimiter))
 
 
+# ── Shared SQL sampler plumbing ──────────────────────────────────────
+
+
+_S = TypeVar("_S", bound="_SqlSampler")
+
+
+class _SqlSampler:
+    """Connection plumbing the SQL value samplers share (#59).
+
+    A subclass supplies ``_conn_lazy`` and its dialect's SQL. :meth:`_row` runs one query
+    and returns the first row, or ``None`` when it could not connect or run (logged as
+    ``<_log_name>_connect_failed`` / ``_query_failed``): a probe that cannot measure
+    answers "not evaluated", never a number. :meth:`_two_pass` is the strict-then-normalized
+    overlap decision (#12). Postgres and Snowflake keep their own governed query paths.
+    """
+
+    #: Prefix of this sampler's log events.
+    _log_name = "sql_sampler"
+    _conn: Any = None
+
+    def _conn_lazy(self) -> Any:  # pragma: no cover - every subclass overrides it
+        raise NotImplementedError
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._conn = None
+
+    def __enter__(self: _S) -> _S:
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def _fetch_first(self, conn: Any, query: str, params: tuple) -> Optional[tuple]:
+        """The first row of ``query``, through a DB-API cursor."""
+        cur = conn.cursor()
+        try:
+            if params:
+                cur.execute(query, params)
+            else:
+                cur.execute(query)
+            row = cur.fetchone()
+        finally:
+            cur.close()
+        return tuple(row) if row else None
+
+    def _row(self, query: str, params: tuple) -> Optional[tuple]:
+        """Run ``query`` and return its first row, or ``None`` if it could not run."""
+        try:
+            conn = self._conn_lazy()
+        except Exception as err:  # noqa: BLE001
+            logger.warning(f"{self._log_name}_connect_failed", error=str(err))
+            return None
+        try:
+            return self._fetch_first(conn, query, params)
+        except Exception as err:  # noqa: BLE001
+            logger.warning(f"{self._log_name}_query_failed", error=str(err))
+            return None
+
+    def _scalar(self, query: str, params: tuple) -> SamplerResult:
+        row = self._row(query, params)
+        if not row or row[0] is None:
+            return None
+        return float(row[0])
+
+    @staticmethod
+    def _two_pass(run: Callable[[bool], Optional[float]]) -> SamplerResult:
+        """Strict overlap, then the normalized one only when the strict is inconclusive.
+
+        ``None`` from the strict pass (a failed query, or no non-null local value) means
+        the pair was not evaluated, which is not a zero: zero is the veto (#52).
+        """
+        exact = run(False)
+        if exact is None:
+            return None
+        if _conclusive(exact):
+            return Overlap(exact, normalized=False)
+        return _better(exact, run(True))
+
+
+class _DerivedTableSampler(_SqlSampler):
+    """The MySQL and Databricks measurements, written once (#59).
+
+    Neither has a ``FILTER (WHERE …)`` aggregate, so the overlap fraction is a
+    ``SUM(CASE WHEN …)`` over a ``LEFT JOIN`` of two distinct-valued derived tables; only
+    the local side is bounded (#10). The dialects differ in four places, and a subclass
+    overrides only those: :meth:`_qt` (table name), :meth:`_as_text` (text cast),
+    :meth:`_limit` (row cap and its parameters) and :attr:`_strict_on` (the strict join).
+    """
+
+    #: The strict pass's join condition. The normalized pass has folded case already.
+    _strict_on = "l.v = f.v"
+    schema_name: str
+    limit: int
+
+    def _qi(self, name: str) -> str:
+        return "`" + name.replace("`", "``") + "`"
+
+    def _qt(self, table: str) -> str:
+        return f"{self._qi(self.schema_name)}.{self._qi(table)}"
+
+    def _as_text(self, expr: str) -> str:
+        return f"CAST({expr} AS CHAR)"
+
+    def _limit(self) -> tuple[str, tuple]:
+        return "LIMIT %s", (self.limit,)
+
+    def __call__(
+        self,
+        local_table: str,
+        local_column: str,
+        foreign_table: str,
+        foreign_column: str,
+    ) -> SamplerResult:
+        """Return the fraction of distinct local values present in the
+        foreign column, or ``None`` if the query failed."""
+        # Issue #10: the local side is bounded (an estimate is fair); the referenced
+        # side is not. Comparing against a sampled parent is a different question, and
+        # a valid FK into a table larger than the bound would score near zero.
+        # Issue #12: a key differing only in case or padding must not read as absent.
+        # The normalized pass is a second scan of the referenced column, so it runs
+        # only when the strict score leaves the outcome open.
+        lc, fc = self._qi(local_column), self._qi(foreign_column)
+        limit, params = self._limit()
+
+        def run(norm: bool) -> Optional[float]:
+            lk = f"LOWER(TRIM({self._as_text(lc)}))" if norm else lc
+            fk_ = f"LOWER(TRIM({self._as_text(fc)}))" if norm else fc
+            on = "l.v = f.v" if norm else self._strict_on
+            q = f"""
+                SELECT SUM(CASE WHEN f.v IS NOT NULL THEN 1 ELSE 0 END)
+                           / GREATEST(COUNT(*), 1) AS overlap
+                FROM (
+                    SELECT DISTINCT {lk} AS v
+                    FROM {self._qt(local_table)}
+                    WHERE {lc} IS NOT NULL
+                    {limit}
+                ) l
+                LEFT JOIN (
+                    SELECT DISTINCT {fk_} AS v
+                    FROM {self._qt(foreign_table)}
+                    WHERE {fc} IS NOT NULL
+                ) f ON {on}
+            """  # noqa: S608 - identifiers are backtick-quoted; the limit is an int we own
+            row = self._row(q, params)
+            return None if not row or row[0] is None else float(row[0])
+
+        return self._two_pass(run)
+
+    # ── Denormalization probes (PRD Phase 11) ──────────────────────
+
+    def distinct_ratio(self, table: str, column: str) -> SamplerResult:
+        limit, params = self._limit()
+        q = f"""
+            SELECT COUNT(DISTINCT v) / GREATEST(COUNT(*), 1) AS ratio
+            FROM (
+                SELECT {self._qi(column)} AS v
+                FROM {self._qt(table)}
+                WHERE {self._qi(column)} IS NOT NULL
+                {limit}
+            ) s
+        """  # noqa: S608 - identifiers are backtick-quoted; the limit is an int we own
+        return self._scalar(q, params)
+
+    def group_single_valued(
+        self, table: str, determinant_columns: list[str], dependent_column: str
+    ) -> SamplerResult:
+        limit, params = self._limit()
+        det = ", ".join(self._qi(c) for c in determinant_columns)
+        not_null = " AND ".join(f"{self._qi(c)} IS NOT NULL" for c in determinant_columns)
+        q = f"""
+            SELECT AVG(CASE WHEN dcount <= 1 THEN 1.0 ELSE 0.0 END) AS frac
+            FROM (
+                SELECT COUNT(DISTINCT dep) AS dcount
+                FROM (
+                    SELECT {det}, {self._qi(dependent_column)} AS dep
+                    FROM {self._qt(table)}
+                    {limit}
+                ) s
+                WHERE {not_null}
+                GROUP BY {det}
+            ) g
+        """  # noqa: S608 - identifiers are backtick-quoted; the limit is an int we own
+        return self._scalar(q, params)
+
+    def delimiter_rate(self, table: str, column: str, delimiter: str) -> SamplerResult:
+        limit, params = self._limit()
+        q = f"""
+            SELECT AVG(CASE WHEN LOCATE(%s, v) > 0 THEN 1.0 ELSE 0.0 END) AS rate
+            FROM (
+                SELECT {self._qi(column)} AS v
+                FROM {self._qt(table)}
+                WHERE {self._qi(column)} IS NOT NULL
+                {limit}
+            ) s
+        """  # noqa: S608 - identifiers are backtick-quoted; the limit is an int we own
+        return self._scalar(q, (delimiter, *params))
+
+
 # ── Concrete MySQL value sampler ────────────────────────────────────
 
 
-class MySQLValueSampler:
+class MySQLValueSampler(_DerivedTableSampler):
     """Sampler that computes FK value-overlap ratios via MySQL / MariaDB.
 
-    The MySQL analog of :class:`PostgresValueSampler`. MySQL has no
-    ``FILTER (WHERE …)`` aggregate, so the overlap fraction is computed with
-    ``SUM(CASE WHEN … )`` over a ``LEFT JOIN`` of two bounded, distinct-valued
-    derived tables (default 10k rows per side).
+    The MySQL analog of :class:`PostgresValueSampler`; its SQL is
+    :class:`_DerivedTableSampler`'s (default 10k rows on the local side).
 
     The database to query is taken from the connection string's path
     component; a non-default ``schema_name`` overrides it. The sampler is
     resilient: any driver error is logged and surfaced as ``None`` so the
     name-based score still wins. Call :meth:`close` to release the connection.
     """
+
+    _log_name = "mysql_sampler"
+    # BINARY on the strict join so the measurement does not depend on the server's
+    # collation, which is often case-insensitive.
+    _strict_on = "BINARY l.v = BINARY f.v"
 
     def __init__(
         self,
@@ -1288,163 +1494,11 @@ class MySQLValueSampler:
             self._conn = pymysql.connect(**self._connect_params)
         return self._conn
 
-    def close(self) -> None:
-        if self._conn is not None:
-            try:
-                self._conn.close()
-            except Exception:  # noqa: BLE001
-                pass
-            self._conn = None
-
-    def __enter__(self) -> "MySQLValueSampler":
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self.close()
-
-    def _qi(self, name: str) -> str:
-        return "`" + name.replace("`", "``") + "`"
-
-    def __call__(
-        self,
-        local_table: str,
-        local_column: str,
-        foreign_table: str,
-        foreign_column: str,
-    ) -> SamplerResult:
-        """Return the fraction of distinct local values present in the
-        foreign column, or ``None`` if the query failed."""
-        try:
-            conn = self._conn_lazy()
-        except Exception as err:  # noqa: BLE001
-            logger.warning("fk_sampler_connect_failed", error=str(err))
-            return None
-
-        db = self._qi(self.schema_name)
-        # Issue #10: the local side is bounded (an estimate is fair); the referenced
-        # side is not. Comparing against a sampled parent is a different question, and
-        # a valid FK into a table larger than the bound would score near zero.
-        # Issue #12: a key differing only in case or padding must not read as absent.
-        # The strict pass is forced binary because MySQL's default collation is often
-        # case-insensitive — the answer must not depend on how this server was
-        # configured. The normalized pass is a second scan of the referenced column,
-        # so it runs only when the strict score leaves the outcome open.
-        def q(norm: bool) -> str:
-            lc, fc = self._qi(local_column), self._qi(foreign_column)
-            lk = f"LOWER(TRIM(CAST({lc} AS CHAR)))" if norm else lc
-            fk_ = f"LOWER(TRIM(CAST({fc} AS CHAR)))" if norm else fc
-            # BINARY on the strict join so the measurement does not depend on the
-            # server's collation; the normalized pass has already folded case away.
-            on = "l.v = f.v" if norm else "BINARY l.v = BINARY f.v"
-            return f"""
-                SELECT SUM(CASE WHEN f.v IS NOT NULL THEN 1 ELSE 0 END)
-                           / GREATEST(COUNT(*), 1) AS overlap
-                FROM (
-                    SELECT DISTINCT {lk} AS v
-                    FROM {db}.{self._qi(local_table)}
-                    WHERE {lc} IS NOT NULL
-                    LIMIT %s
-                ) l
-                LEFT JOIN (
-                    SELECT DISTINCT {fk_} AS v
-                    FROM {db}.{self._qi(foreign_table)}
-                    WHERE {fc} IS NOT NULL
-                ) f ON {on}
-            """  # noqa: S608 - identifiers are backtick-quoted; db is from the catalog
-
-        try:
-            with conn.cursor() as cur:
-                cur.execute(q(False), (self.limit,))
-                row = cur.fetchone()
-                if not row:
-                    return None
-                exact = None if row[0] is None else float(row[0])
-                if _conclusive(exact):
-                    return Overlap(exact, normalized=False)  # type: ignore[arg-type]
-                cur.execute(q(True), (self.limit,))
-                row = cur.fetchone()
-                norm = None if not row or row[0] is None else float(row[0])
-                return _better(exact, norm)
-        except Exception as err:  # noqa: BLE001
-            logger.warning(
-                "fk_sampler_query_failed",
-                local=f"{local_table}.{local_column}",
-                foreign=f"{foreign_table}.{foreign_column}",
-                error=str(err),
-            )
-            return None
-
-    # ── Denormalization probes (PRD Phase 11) ──────────────────────
-
-    def _scalar(self, query: str, params: tuple) -> SamplerResult:
-        try:
-            conn = self._conn_lazy()
-        except Exception as err:  # noqa: BLE001
-            logger.warning("denorm_sampler_connect_failed", error=str(err))
-            return None
-        try:
-            with conn.cursor() as cur:
-                cur.execute(query, params)
-                row = cur.fetchone()
-            if not row or row[0] is None:
-                return None
-            return float(row[0])
-        except Exception as err:  # noqa: BLE001
-            logger.warning("denorm_sampler_query_failed", error=str(err))
-            return None
-
-    def distinct_ratio(self, table: str, column: str) -> SamplerResult:
-        db = self._qi(self.schema_name)
-        q = f"""
-            SELECT COUNT(DISTINCT v) / GREATEST(COUNT(*), 1) AS ratio
-            FROM (
-                SELECT {self._qi(column)} AS v
-                FROM {db}.{self._qi(table)}
-                WHERE {self._qi(column)} IS NOT NULL
-                LIMIT %s
-            ) s
-        """  # noqa: S608 - identifiers are backtick-quoted; db is from the catalog
-        return self._scalar(q, (self.limit,))
-
-    def group_single_valued(
-        self, table: str, determinant_columns: list[str], dependent_column: str
-    ) -> SamplerResult:
-        db = self._qi(self.schema_name)
-        det = ", ".join(self._qi(c) for c in determinant_columns)
-        not_null = " AND ".join(f"{self._qi(c)} IS NOT NULL" for c in determinant_columns)
-        q = f"""
-            SELECT AVG(CASE WHEN dcount <= 1 THEN 1.0 ELSE 0.0 END) AS frac
-            FROM (
-                SELECT COUNT(DISTINCT dep) AS dcount
-                FROM (
-                    SELECT {det}, {self._qi(dependent_column)} AS dep
-                    FROM {db}.{self._qi(table)}
-                    LIMIT %s
-                ) s
-                WHERE {not_null}
-                GROUP BY {det}
-            ) g
-        """  # noqa: S608 - identifiers are backtick-quoted; db is from the catalog
-        return self._scalar(q, (self.limit,))
-
-    def delimiter_rate(self, table: str, column: str, delimiter: str) -> SamplerResult:
-        db = self._qi(self.schema_name)
-        q = f"""
-            SELECT AVG(CASE WHEN LOCATE(%s, v) > 0 THEN 1.0 ELSE 0.0 END) AS rate
-            FROM (
-                SELECT {self._qi(column)} AS v
-                FROM {db}.{self._qi(table)}
-                WHERE {self._qi(column)} IS NOT NULL
-                LIMIT %s
-            ) s
-        """  # noqa: S608 - identifiers are backtick-quoted; db is from the catalog
-        return self._scalar(q, (delimiter, self.limit))
-
 
 # ── Concrete SQL Server value sampler ───────────────────────────────
 
 
-class SQLServerValueSampler:
+class SQLServerValueSampler(_SqlSampler):
     """Sampler that computes FK value-overlap ratios via Microsoft SQL Server.
 
     The SQL Server analog of :class:`MySQLValueSampler`, using T-SQL ``TOP (n)``
@@ -1470,6 +1524,8 @@ class SQLServerValueSampler:
         self.schema_name = "dbo" if schema_name in _DEFAULT_SCHEMA_SENTINELS else schema_name
         self._conn = None
 
+    _log_name = "sqlserver_sampler"
+
     def _conn_lazy(self):
         if self._conn is None:
             from .connectors.mssql import _load_pymssql
@@ -1477,20 +1533,6 @@ class SQLServerValueSampler:
             pymssql = _load_pymssql()
             self._conn = pymssql.connect(**self._connect_params)
         return self._conn
-
-    def close(self) -> None:
-        if self._conn is not None:
-            try:
-                self._conn.close()
-            except Exception:  # noqa: BLE001
-                pass
-            self._conn = None
-
-    def __enter__(self) -> "SQLServerValueSampler":
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self.close()
 
     def _qi(self, name: str) -> str:
         return "[" + name.replace("]", "]]") + "]"
@@ -1504,12 +1546,6 @@ class SQLServerValueSampler:
     ) -> SamplerResult:
         """Return the fraction of distinct local values present in the
         foreign column, or ``None`` if the query failed."""
-        try:
-            conn = self._conn_lazy()
-        except Exception as err:  # noqa: BLE001
-            logger.warning("fk_sampler_connect_failed", error=str(err))
-            return None
-
         s = self._qi(self.schema_name)
         # Issue #10: the local side is bounded (an estimate is fair); the referenced
         # side is not. Comparing against a sampled parent is a different question, and
@@ -1550,52 +1586,13 @@ class SQLServerValueSampler:
                 ) f ON {on}
             """  # noqa: S608 - identifiers are bracket-quoted; schema is from the catalog
 
-        try:
-            cur = conn.cursor()
-            try:
-                cur.execute(q(False), (self.limit,))
-                row = cur.fetchone()
-                if not row:
-                    return None
-                exact = None if row[0] is None else float(row[0])
-                if _conclusive(exact):
-                    return Overlap(exact, normalized=False)  # type: ignore[arg-type]
-                cur.execute(q(True), (self.limit,))
-                row = cur.fetchone()
-                norm = None if not row or row[0] is None else float(row[0])
-            finally:
-                cur.close()
-            return _better(exact, norm)
-        except Exception as err:  # noqa: BLE001
-            logger.warning(
-                "fk_sampler_query_failed",
-                local=f"{local_table}.{local_column}",
-                foreign=f"{foreign_table}.{foreign_column}",
-                error=str(err),
-            )
-            return None
+        def run(norm: bool) -> Optional[float]:
+            row = self._row(q(norm), (self.limit,))
+            return None if not row or row[0] is None else float(row[0])
+
+        return self._two_pass(run)
 
     # ── Denormalization probes (PRD Phase 11) ──────────────────────
-
-    def _scalar(self, query: str, params: tuple) -> SamplerResult:
-        try:
-            conn = self._conn_lazy()
-        except Exception as err:  # noqa: BLE001
-            logger.warning("denorm_sampler_connect_failed", error=str(err))
-            return None
-        try:
-            cur = conn.cursor()
-            try:
-                cur.execute(query, params)
-                row = cur.fetchone()
-            finally:
-                cur.close()
-            if not row or row[0] is None:
-                return None
-            return float(row[0])
-        except Exception as err:  # noqa: BLE001
-            logger.warning("denorm_sampler_query_failed", error=str(err))
-            return None
 
     def distinct_ratio(self, table: str, column: str) -> SamplerResult:
         s = self._qi(self.schema_name)
@@ -1645,7 +1642,7 @@ class SQLServerValueSampler:
 # ── Concrete Databricks value sampler ───────────────────────────────
 
 
-class DatabricksValueSampler:
+class DatabricksValueSampler(_DerivedTableSampler):
     """Sampler that computes FK value-overlap ratios via Databricks SQL.
 
     Value overlap matters more on Databricks than anywhere else: Unity Catalog
@@ -1653,9 +1650,7 @@ class DatabricksValueSampler:
     undeclared one is invisible to the catalog. Sampling is the only evidence
     that two columns actually join.
 
-    Spark SQL has no ``FILTER (WHERE …)`` aggregate, so — like
-    :class:`MySQLValueSampler` — the overlap fraction is a ``SUM(CASE WHEN …)``
-    over a ``LEFT JOIN`` of two bounded, distinct-valued subqueries. Tables are
+    The SQL is :class:`_DerivedTableSampler`'s, as for MySQL. Tables are
     addressed with Unity Catalog's three-level ``catalog.schema.table`` name.
     Row limits are inlined rather than bound, because Spark SQL requires a
     constant in ``LIMIT``; they are ints under our control, never user text.
@@ -1663,6 +1658,8 @@ class DatabricksValueSampler:
     Any driver error is logged and surfaced as ``None`` so the name-based score
     still wins. Call :meth:`close` to release the connection.
     """
+
+    _log_name = "databricks_sampler"
 
     def __init__(
         self,
@@ -1700,156 +1697,21 @@ class DatabricksValueSampler:
             )
         return self._conn
 
-    def close(self) -> None:
-        if self._conn is not None:
-            try:
-                self._conn.close()
-            except Exception:  # noqa: BLE001
-                pass
-            self._conn = None
-
-    def __enter__(self) -> "DatabricksValueSampler":
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self.close()
-
-    def _qi(self, name: str) -> str:
-        return "`" + name.replace("`", "``") + "`"
-
     def _qt(self, table: str) -> str:
         """Fully-qualified ``catalog.schema.table``."""
         return f"{self._qi(self.catalog)}.{self._qi(self.schema_name)}.{self._qi(table)}"
 
-    def __call__(
-        self,
-        local_table: str,
-        local_column: str,
-        foreign_table: str,
-        foreign_column: str,
-    ) -> SamplerResult:
-        """Return the fraction of distinct local values present in the
-        foreign column, or ``None`` if the query failed."""
-        # Issue #10: the local side is bounded (an estimate is fair); the referenced
-        # side is not. Comparing against a sampled parent is a different question, and
-        # a valid FK into a table larger than the bound would score near zero.
-        # Issue #12: a key differing only in case or padding must not read as absent.
-        # The normalized pass rescans the referenced column, so it runs only when the
-        # strict score leaves the outcome open (_STRICT_IS_CONCLUSIVE).
-        lc, fc = self._qi(local_column), self._qi(foreign_column)
+    def _as_text(self, expr: str) -> str:
+        return f"CAST({expr} AS STRING)"
 
-        def run(norm: bool) -> Optional[float]:
-            lk = f"LOWER(TRIM(CAST({lc} AS STRING)))" if norm else lc
-            fk_ = f"LOWER(TRIM(CAST({fc} AS STRING)))" if norm else fc
-            q = f"""
-                SELECT SUM(CASE WHEN f.v IS NOT NULL THEN 1 ELSE 0 END)
-                           / GREATEST(COUNT(*), 1) AS overlap
-                FROM (
-                    SELECT DISTINCT {lk} AS v
-                    FROM {self._qt(local_table)}
-                    WHERE {lc} IS NOT NULL
-                    LIMIT {self.limit}
-                ) l
-                LEFT JOIN (
-                    SELECT DISTINCT {fk_} AS v
-                    FROM {self._qt(foreign_table)}
-                    WHERE {fc} IS NOT NULL
-                ) f ON l.v = f.v
-            """  # noqa: S608 - identifiers are backtick-quoted; limit is an int we own
-            row = self._row(q, ())
-            return None if not row or row[0] is None else float(row[0])
-
-        exact = run(False)
-        if exact is None:
-            logger.warning(
-                "fk_sampler_query_failed",
-                local=f"{local_table}.{local_column}",
-                foreign=f"{foreign_table}.{foreign_column}",
-            )
-            return None
-        if _conclusive(exact):
-            return Overlap(exact, normalized=False)
-        return _better(exact, run(True))
-
-    # ── Denormalization probes (PRD Phase 11) ──────────────────────
-
-    def _row(self, query: str, params: tuple) -> Optional[tuple]:
-        """Run ``query`` and return its first row, or ``None`` if it could not run."""
-        try:
-            conn = self._conn_lazy()
-        except Exception as err:  # noqa: BLE001
-            logger.warning("databricks_sampler_connect_failed", error=str(err))
-            return None
-        try:
-            cur = conn.cursor()
-            try:
-                if params:
-                    cur.execute(query, params)
-                else:
-                    cur.execute(query)
-                row = cur.fetchone()
-            finally:
-                cur.close()
-            return tuple(row) if row else None
-        except Exception as err:  # noqa: BLE001
-            logger.warning("databricks_sampler_query_failed", error=str(err))
-            return None
-
-    def _scalar(self, query: str, params: tuple) -> SamplerResult:
-        row = self._row(query, params)
-        if not row or row[0] is None:
-            return None
-        return float(row[0])
-
-    def distinct_ratio(self, table: str, column: str) -> SamplerResult:
-        q = f"""
-            SELECT COUNT(DISTINCT v) / GREATEST(COUNT(*), 1) AS ratio
-            FROM (
-                SELECT {self._qi(column)} AS v
-                FROM {self._qt(table)}
-                WHERE {self._qi(column)} IS NOT NULL
-                LIMIT {self.limit}
-            ) s
-        """  # noqa: S608 - identifiers are backtick-quoted; limit is an int we own
-        return self._scalar(q, ())
-
-    def group_single_valued(
-        self, table: str, determinant_columns: list[str], dependent_column: str
-    ) -> SamplerResult:
-        det = ", ".join(self._qi(c) for c in determinant_columns)
-        not_null = " AND ".join(f"{self._qi(c)} IS NOT NULL" for c in determinant_columns)
-        q = f"""
-            SELECT AVG(CASE WHEN dcount <= 1 THEN 1.0 ELSE 0.0 END) AS frac
-            FROM (
-                SELECT COUNT(DISTINCT dep) AS dcount
-                FROM (
-                    SELECT {det}, {self._qi(dependent_column)} AS dep
-                    FROM {self._qt(table)}
-                    LIMIT {self.limit}
-                ) s
-                WHERE {not_null}
-                GROUP BY {det}
-            ) g
-        """  # noqa: S608 - identifiers are backtick-quoted; limit is an int we own
-        return self._scalar(q, ())
-
-    def delimiter_rate(self, table: str, column: str, delimiter: str) -> SamplerResult:
-        q = f"""
-            SELECT AVG(CASE WHEN LOCATE(%s, v) > 0 THEN 1.0 ELSE 0.0 END) AS rate
-            FROM (
-                SELECT {self._qi(column)} AS v
-                FROM {self._qt(table)}
-                WHERE {self._qi(column)} IS NOT NULL
-                LIMIT {self.limit}
-            ) s
-        """  # noqa: S608 - identifiers are backtick-quoted; limit is an int we own
-        return self._scalar(q, (delimiter,))
+    def _limit(self) -> tuple[str, tuple]:
+        return f"LIMIT {int(self.limit)}", ()
 
 
 # ── Concrete DuckDB value sampler ───────────────────────────────────
 
 
-class DuckDbValueSampler:
+class DuckDbValueSampler(_SqlSampler):
     """Sampler that computes FK value-overlap and denormalization probes via DuckDB.
 
     DuckDB is this project's always-on engine (see the testing matrix in
@@ -1891,21 +1753,6 @@ class DuckDbValueSampler:
             self._conn = duckdb.connect(self.connection_string, read_only=True)
         return self._conn
 
-    def close(self) -> None:
-        if self._conn is not None:
-            try:
-                self._conn.close()
-            except Exception:  # noqa: BLE001
-                pass
-            self._conn = None
-
-    def __enter__(self) -> "DuckDbValueSampler":
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self.close()
-
-    #: Prefix of this sampler's log events.
     _log_name = "duckdb_sampler"
 
     def _qi(self, name: str) -> str:
@@ -1928,25 +1775,9 @@ class DuckDbValueSampler:
     def _qt(self, table: str) -> str:
         return f"{self._qi(self.schema_name)}.{self._qi(table)}"
 
-    def _row(self, query: str, params: tuple) -> Optional[tuple]:
-        """Run ``query`` and return its first row, or ``None`` if it could not run."""
-        try:
-            conn = self._conn_lazy()
-        except Exception as err:  # noqa: BLE001
-            logger.warning(f"{self._log_name}_connect_failed", error=str(err))
-            return None
-        try:
-            row = conn.execute(query, params).fetchone() if params else conn.execute(query).fetchone()
-            return tuple(row) if row else None
-        except Exception as err:  # noqa: BLE001
-            logger.warning(f"{self._log_name}_query_failed", error=str(err))
-            return None
-
-    def _scalar(self, query: str, params: tuple) -> SamplerResult:
-        row = self._row(query, params)
-        if not row or row[0] is None:
-            return None
-        return float(row[0])
+    def _fetch_first(self, conn: Any, query: str, params: tuple) -> Optional[tuple]:
+        row = conn.execute(query, params).fetchone() if params else conn.execute(query).fetchone()
+        return tuple(row) if row else None
 
     def __call__(
         self,
@@ -1986,15 +1817,7 @@ class DuckDbValueSampler:
             row = self._row(q, (self.limit,))
             return None if not row or row[0] is None else float(row[0])
 
-        # None: the query failed (``_row`` logged it), or the local sample held no
-        # non-null value. Either way the pair was not evaluated, which is not a zero
-        # overlap: zero is the veto, and it deleted correct keys on empty columns (#52).
-        exact = run(False)
-        if exact is None:
-            return None
-        if _conclusive(exact):
-            return Overlap(exact, normalized=False)
-        return _better(exact, run(True))
+        return self._two_pass(run)
 
     # ── Denormalization probes ─────────────────────────────────────
 

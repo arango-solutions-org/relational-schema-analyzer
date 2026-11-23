@@ -1183,3 +1183,57 @@ class TestPostgresSamplerGovernance:
         plain = create_value_sampler("postgresql", "postgresql://x/y")
         assert (plain.max_queries, plain.statement_timeout_s, plain.query_tag) == (None, None, None)
 
+
+
+class TestSharedSamplerPlumbing:
+    """MySQL, SQL Server and Databricks now share one connection path and one two-pass
+    decision with DuckDB (#59), so they behave alike where they used to differ."""
+
+    class _Conn:
+        def __init__(self, results):
+            self.results, self.sql = list(results), []
+
+        def cursor(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            pass
+
+        def execute(self, sql, params=()):
+            self.sql.append(sql)
+            result = self.results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            self._row = result
+
+        def fetchone(self):
+            return self._row
+
+        def close(self):
+            pass
+
+    @staticmethod
+    def _sampler(cls, conn):
+        sampler = cls.__new__(cls)
+        sampler.limit, sampler.schema_name, sampler.catalog, sampler._conn = 100, "s", "c", conn
+        return sampler
+
+    @pytest.mark.parametrize(
+        "cls", [MySQLValueSampler, SQLServerValueSampler, DatabricksValueSampler]
+    )
+    def test_a_failed_normalized_pass_keeps_the_strict_score(self, cls):
+        """MySQL and SQL Server used to discard a good strict score when the second,
+        normalized query failed; Postgres, Databricks and DuckDB kept it."""
+        conn = self._Conn([(0.5,), RuntimeError("normalized query failed")])
+        assert self._sampler(cls, conn)("child", "pid", "parent", "id") == pytest.approx(0.5)
+
+    @pytest.mark.parametrize(
+        "cls", [MySQLValueSampler, SQLServerValueSampler, DatabricksValueSampler]
+    )
+    def test_an_empty_sample_spends_one_query_not_two(self, cls):
+        conn = self._Conn([(None,)])
+        assert self._sampler(cls, conn)("child", "pid", "parent", "id") is None
+        assert len(conn.sql) == 1, "nothing to compare, so no normalized pass"
