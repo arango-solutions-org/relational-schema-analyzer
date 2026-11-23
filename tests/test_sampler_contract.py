@@ -59,6 +59,8 @@ def _duckdb_fixture(tmp_path) -> Callable[[], Any]:
         f"INSERT INTO orders SELECT i, {PARENT_ROWS} - (i % {CHILD_VALUES}) "
         f"FROM range(1, 201) t(i)"
     )
+    # Issue #52: a reference column that holds no value at all.
+    conn.execute("ALTER TABLE orders ADD COLUMN ghost_id INTEGER")
     # Issue #12: text keys whose values agree only after case/whitespace normalization.
     conn.execute("CREATE TABLE accounts (code VARCHAR PRIMARY KEY)")
     conn.execute(
@@ -86,6 +88,7 @@ def _sqlite_fixture(tmp_path) -> Callable[[], Any]:
         "INSERT INTO orders VALUES (?, ?)",
         [(i, PARENT_ROWS - (i % CHILD_VALUES)) for i in range(1, 201)],
     )
+    conn.execute("ALTER TABLE orders ADD COLUMN ghost_id INTEGER")  # #52: all NULL
     conn.execute("CREATE TABLE accounts (code TEXT PRIMARY KEY)")
     conn.executemany(
         "INSERT INTO accounts VALUES (?)", [(f"CUST{i}",) for i in range(1, PARENT_ROWS + 1)]
@@ -111,8 +114,8 @@ def _csv_fixture(tmp_path) -> Callable[[], Any]:
         "id\n" + "\n".join(str(i) for i in range(1, PARENT_ROWS + 1)), encoding="utf-8"
     )
     (d / "orders.csv").write_text(
-        "id,customer_id\n"
-        + "\n".join(f"{i},{PARENT_ROWS - (i % CHILD_VALUES)}" for i in range(1, 201)),
+        "id,customer_id,ghost_id\n"  # ghost_id: always empty (#52)
+        + "\n".join(f"{i},{PARENT_ROWS - (i % CHILD_VALUES)}," for i in range(1, 201)),
         encoding="utf-8",
     )
     # Issue #12: text keys whose values agree only after case/whitespace normalization.
@@ -223,6 +226,26 @@ class TestCaseAndWhitespaceDoNotVeto:
         )
 
 
+class TestAnEmptySampleIsNotEvaluated:
+    """No non-null local value means the pair was not evaluated: ``None``, never ``0.0``.
+
+    Zero is the hard veto. Postgres, DuckDB and SQLite divided by ``GREATEST(COUNT(*), 1)``,
+    so an all-NULL reference column scored 0.0 and deleted a correct, name-matched key,
+    while the other engines returned ``None`` for the same column and kept it (#52).
+    """
+
+    @pytest.mark.parametrize("name", sorted(EMBEDDED))
+    def test_an_all_null_reference_column_is_not_a_zero(self, name, tmp_path):
+        sampler = EMBEDDED[name](tmp_path)()
+        try:
+            score = sampler("orders", "ghost_id", "customers", "id")
+        finally:
+            close = getattr(sampler, "close", None)
+            if close:
+                close()
+        assert score is None, f"{name} scored {score!r} for a column with no values"
+
+
 class TestKeyProbeCoverage:
     """Which samplers can discover keys from data — and which cannot, on purpose.
 
@@ -328,11 +351,14 @@ class TestLiveEnginesHonourTheContract:
                 f"ALTER TABLE {schema}.orders ADD CONSTRAINT fk "
                 f"FOREIGN KEY (customer_id) REFERENCES {schema}.customers(id)"
             )
+            c.execute(f"ALTER TABLE {schema}.orders ADD COLUMN ghost_id INT")  # #52
         sampler = fk.PostgresValueSampler(dsn, schema_name=schema, limit=BOUND)
         try:
             score = sampler("orders", "customer_id", "customers", "id")
+            empty = sampler("orders", "ghost_id", "customers", "id")
         finally:
             sampler.close()
             with psycopg.connect(dsn, autocommit=True) as c:
                 c.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
         assert score == pytest.approx(1.0), f"Postgres scored {score} for a database-enforced FK"
+        assert empty is None, f"Postgres scored {empty!r} for a column with no values (#52)"
