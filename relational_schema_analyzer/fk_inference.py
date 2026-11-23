@@ -1088,8 +1088,8 @@ class PostgresValueSampler:
         # Normalizing means a second full scan of the referenced column, so it runs
         # only when the strict score leaves the outcome open (_STRICT_IS_CONCLUSIVE).
         def q(norm: bool) -> str:
-            # The strict pass is byte-for-byte the query 0.9.1 ran, so a healthy
-            # foreign key costs exactly what it used to.
+            # The strict pass costs what 0.9.1's did. NULLIF, not GREATEST: an empty
+            # local sample is "not evaluated", never a zero overlap, which vetoes (#52).
             lk = f"lower(btrim({self._qi(local_column)}::text))" if norm else self._qi(local_column)
             fk_ = f"lower(btrim({self._qi(foreign_column)}::text))" if norm else self._qi(foreign_column)
             return f"""
@@ -1106,7 +1106,7 @@ class PostgresValueSampler:
                 )
                 SELECT
                     COUNT(*) FILTER (WHERE f.v IS NOT NULL)::float
-                        / GREATEST(COUNT(*), 1)::float AS overlap
+                        / NULLIF(COUNT(*), 0)::float AS overlap
                 FROM l
                 LEFT JOIN f ON l.v = f.v
             """  # noqa: S608 - identifiers are quoted with " and schema is from catalog
@@ -1114,9 +1114,11 @@ class PostgresValueSampler:
         row = self._execute(q(False), (self.limit,), what="fk_sampler")
         if not row:
             return None
-        exact = None if row[0] is None else float(row[0])
+        if row[0] is None:
+            return None  # no non-null local value: nothing to compare, and no budget to spend
+        exact = float(row[0])
         if _conclusive(exact):
-            return Overlap(exact, normalized=False)  # type: ignore[arg-type]
+            return Overlap(exact, normalized=False)
         row = self._execute(q(True), (self.limit,), what="fk_sampler")
         norm = None if not row or row[0] is None else float(row[0])
         return _better(exact, norm)
@@ -1978,19 +1980,17 @@ class DuckDbValueSampler:
                     FROM {self._qt(foreign_table)}
                     WHERE {fc} IS NOT NULL
                 )
-                SELECT {share}
+                SELECT CASE WHEN COUNT(*) = 0 THEN NULL ELSE {share} END
                 FROM l LEFT JOIN f ON l.v = f.v
             """  # noqa: S608 - identifiers are quoted; limits are bound ints we own
             row = self._row(q, (self.limit,))
             return None if not row or row[0] is None else float(row[0])
 
+        # None: the query failed (``_row`` logged it), or the local sample held no
+        # non-null value. Either way the pair was not evaluated, which is not a zero
+        # overlap: zero is the veto, and it deleted correct keys on empty columns (#52).
         exact = run(False)
         if exact is None:
-            logger.warning(
-                "fk_sampler_query_failed",
-                local=f"{local_table}.{local_column}",
-                foreign=f"{foreign_table}.{foreign_column}",
-            )
             return None
         if _conclusive(exact):
             return Overlap(exact, normalized=False)
