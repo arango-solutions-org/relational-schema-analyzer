@@ -28,7 +28,8 @@ from contextlib import redirect_stderr, redirect_stdout
 
 import pytest
 
-from relational_schema_analyzer.cli import _keep_logs_off_stdout, main
+from relational_schema_analyzer.cli import main
+from relational_schema_analyzer.log import keep_logs_off_stdout as _keep_logs_off_stdout
 
 structlog = pytest.importorskip("structlog", reason="the bug only exists with structlog")
 

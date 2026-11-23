@@ -36,6 +36,7 @@ from .owl_export import (
     export_owl_turtle,
 )
 from .bitemporal import PriorRun, stamp_bitemporal
+from .log import keep_logs_off_stdout
 from .overlay import OverlayError, apply_key_overlay, load_key_overlay
 from .types import PhysicalSchema
 
@@ -251,42 +252,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _keep_logs_off_stdout() -> None:
-    """Send this process's log output to stderr, so stdout carries only the bundle.
-
-    A library must not configure logging — but this is the CLI, and here RSA *is*
-    the application, so it both may and must.
-
-    The bug this closes (reported by r2g): ``log.py`` defers to ``structlog`` when it
-    is installed, and an **unconfigured** structlog writes through ``PrintLogger`` to
-    **stdout**, at debug level. So a single ``logger.debug`` during a run lands in the
-    middle of the JSON::
-
-        $ relational-schema-analyzer analyze --source csv --url ./d --prior-run prev.json
-        2026-10-26 12:03:51 [debug    ] bitemporal_fingerprint_unchanged carried_from=...
-        {"conceptualSchema": ...
-
-    and the caller's ``json.load`` fails. It needed ``--prior-run`` only because that
-    is the one flag whose path logs at debug.
-
-    Invisible without structlog, which is why it survived: RSA never installs it — it
-    is in no extra — so CI always took the stdlib fallback, and that writes to
-    **stderr** at WARNING, where both the stream and the level hide it.
-
-    An application that has already configured structlog keeps its own configuration;
-    this only claims the default.
-    """
-    try:
-        import structlog
-    except ImportError:  # the stdlib fallback already writes to stderr
-        return
-    if structlog.is_configured():
-        return  # the embedding application owns its logging; leave it alone
-    structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=sys.stderr))
-
-
 def main(argv: list[str] | None = None) -> int:
-    _keep_logs_off_stdout()
+    keep_logs_off_stdout()
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)

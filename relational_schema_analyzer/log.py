@@ -13,7 +13,43 @@ configure structured logging get native structured events.
 from __future__ import annotations
 
 import logging
+import sys
 from typing import Any
+
+
+def keep_logs_off_stdout() -> None:
+    """Send this process's log output to stderr, so stdout carries only RSA's output.
+
+    A library must not configure logging. But the CLI and the MCP server are
+    applications, and there RSA both may and must: the CLI's stdout is the bundle, and
+    the stdio MCP server's stdout is the JSON-RPC channel. Both call this first.
+
+    The bug this closes (reported by r2g for the CLI; the MCP server had the same
+    hole): this module defers to ``structlog`` when it is installed, and an
+    **unconfigured** structlog writes through ``PrintLogger`` to **stdout**, at debug
+    level. So a single log line during a run lands in the middle of the output::
+
+        $ relational-schema-analyzer analyze --source csv --url ./d --prior-run prev.json
+        2026-10-26 12:03:51 [debug    ] bitemporal_fingerprint_unchanged carried_from=...
+        {"conceptualSchema": ...
+
+    and the caller's ``json.load`` fails. Over MCP stdio, the client reads the log
+    line as a malformed protocol message.
+
+    Invisible without structlog: RSA requires it nowhere, and the stdlib fallback
+    writes to **stderr** at WARNING, where both the stream and the level hide it.
+
+    An application that has already configured structlog keeps its own configuration;
+    this only claims the default.
+    """
+    try:
+        import structlog
+    except ImportError:  # the stdlib fallback already writes to stderr
+        return
+    if structlog.is_configured():
+        return  # the embedding application owns its logging; leave it alone
+    structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=sys.stderr))
+
 
 try:  # pragma: no cover - exercised indirectly when structlog is present
     import structlog
