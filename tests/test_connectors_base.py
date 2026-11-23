@@ -177,3 +177,49 @@ def test_quote_identifier_doubles_an_embedded_quote():
     assert quote_identifier("orders") == '"orders"'
     assert quote_identifier('we"ird') == '"we""ird"'
     assert quote_identifier("") == '""'
+
+
+class TestSharedTableAssembly:
+    """The rules every connector used to write out for itself (#58)."""
+
+    def test_unique_columns_are_one_column_keys(self):
+        from relational_schema_analyzer.connectors.base import unique_columns
+
+        assert unique_columns(["id"], [["email"], ["code", "region"]]) == {"id", "email"}
+        assert unique_columns(["a", "b"], []) == set(), "a composite key makes no column unique"
+
+    def test_one_to_one_is_exactly_a_key(self):
+        from relational_schema_analyzer.connectors.base import is_one_to_one
+
+        assert is_one_to_one(["customer_id"], ["id"], [["customer_id"]])
+        assert is_one_to_one(["order_id", "line_no"], ["line_no", "order_id"], [])
+        assert not is_one_to_one(["order_id"], ["line_no", "order_id"], []), "part of a key"
+        assert not is_one_to_one(["cust"], ["id"], [])
+
+    def test_fold_resolves_foreign_keys_through_the_referenced_constraint(self):
+        from relational_schema_analyzer.connectors.base import fold_constraints
+
+        tc = [("pk_c", "PRIMARY KEY", "customer"), ("uq_e", "UNIQUE", "customer"),
+              ("fk_o", "FOREIGN KEY", "orders"), ("fk_x", "FOREIGN KEY", "orders")]
+        kcu = [("pk_c", "id", 1), ("uq_e", "email", 1), ("fk_o", "customer_id", 1),
+               ("fk_x", "ghost_id", 1)]
+        rc = [("fk_o", "pk_c"), ("fk_x", "no_such_constraint")]
+        pks, uniques, fks = fold_constraints(tc, kcu, rc, enforced=False)
+        assert pks == {"customer": ["id"]} and uniques == {"customer": [["email"]]}
+        (fk,) = fks["orders"]  # the unresolvable one is skipped
+        assert (fk.columns, fk.foreign_table, fk.foreign_columns) == (["customer_id"], "customer", ["id"])
+        assert fk.enforced is False
+
+    def test_group_foreign_keys_keeps_column_pairs_in_row_order(self):
+        from relational_schema_analyzer.connectors.base import group_foreign_keys
+
+        rows = [
+            {"C": "fk_line", "COL": "line_no", "T": "line", "R": "line_no"},
+            {"C": "fk_line", "COL": "order_id", "T": "line", "R": "order_id"},
+            {"C": "fk_cust", "COL": "cust", "T": "customer", "R": "id"},
+        ]
+        fks = group_foreign_keys(rows, constraint="C", column="COL", ref_table="T", ref_column="R")
+        assert [(f.constraint_name, f.columns, f.foreign_columns) for f in fks] == [
+            ("fk_line", ["line_no", "order_id"], ["line_no", "order_id"]),
+            ("fk_cust", ["cust"], ["id"]),
+        ]

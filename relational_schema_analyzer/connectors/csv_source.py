@@ -37,7 +37,7 @@ from ..dump_reader import DumpReader
 from ..log import get_logger
 from ..naming import singularize
 from ..bitemporal import FILE
-from ..bitemporal import to_iso as _iso
+from ..bitemporal import file_mtime_iso
 from ..types import CheckConstraint, Column, Schema, SourceProvenance, Table
 
 logger = get_logger(__name__)
@@ -169,7 +169,7 @@ class CsvConnector:
             # `catalog` — mtime is reset by a copy, a checkout or a sync, so it dates the
             # *file* and not the data. Naming the source honestly is what lets a consumer
             # decide how much to lean on it.
-            stamp = _file_mtime_iso(path)
+            stamp = file_mtime_iso(path)
             if stamp:
                 table.valid_from = stamp
                 table.valid_time_source = FILE
@@ -376,11 +376,3 @@ class CsvSession:
 
 
 __all__ = ["CsvConnector", "CsvSession"]
-
-
-def _file_mtime_iso(path: Path) -> Optional[str]:
-    """A file's modification time as ISO-8601 UTC, or ``None`` if it cannot be read."""
-    try:
-        return _iso(path.stat().st_mtime)
-    except OSError:
-        return None

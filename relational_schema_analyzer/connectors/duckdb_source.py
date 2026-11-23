@@ -13,12 +13,12 @@ catalog functions rather than ``information_schema``, so both are consulted.
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Optional
 
 from ..log import get_logger
-from ..types import Column, ForeignKey, Schema, SourceProvenance, Table
+from ..types import ForeignKey, Schema, SourceProvenance
+from .base import build_table, fold_constraints
 
 logger = get_logger(__name__)
 
@@ -80,13 +80,16 @@ class DuckDbConnector:
             (self.schema_name,),
         )
         for table_name, table_type in table_rows:
-            schema.tables[table_name] = self._build_table(
-                table_name=table_name,
+            schema.tables[table_name] = build_table(
+                name=table_name,
+                schema_name=self.schema_name,
                 is_view=(str(table_type).upper() == "VIEW"),
                 comment=table_comments.get(table_name),
-                columns=columns_by_table.get(table_name, []),
-                col_comments=col_comments,
-                pk=pks.get(table_name, []),
+                columns=[
+                    {**c, "comment": col_comments.get((table_name, c["name"]))}
+                    for c in columns_by_table.get(table_name, [])
+                ],
+                primary_key=pks.get(table_name, []),
                 unique_sets=uniques.get(table_name, []),
                 fks=fks.get(table_name, []),
             )
@@ -188,92 +191,4 @@ class DuckDbConnector:
         except Exception:  # noqa: BLE001
             rc = []
 
-        cols_by_constraint: dict[str, list[str]] = OrderedDict()
-        for cname, col, _pos in kcu:
-            cols_by_constraint.setdefault(cname, []).append(col)
-
-        type_by_constraint: dict[str, str] = {}
-        table_by_constraint: dict[str, str] = {}
-        for cname, ctype, table_name in tc:
-            type_by_constraint[cname] = ctype
-            table_by_constraint[cname] = table_name
-
-        referenced_uc = {cname: uc for cname, uc in rc}
-
-        pks: dict[str, list[str]] = {}
-        uniques: dict[str, list[list[str]]] = {}
-        fks: dict[str, list[ForeignKey]] = {}
-
-        for cname, ctype in type_by_constraint.items():
-            table_name = table_by_constraint[cname]
-            cols = cols_by_constraint.get(cname, [])
-            if ctype == "PRIMARY KEY":
-                pks[table_name] = cols
-            elif ctype == "UNIQUE":
-                uniques.setdefault(table_name, []).append(cols)
-            elif ctype == "FOREIGN KEY":
-                uc = referenced_uc.get(cname)
-                if not uc:
-                    continue
-                ref_table = table_by_constraint.get(uc)
-                ref_cols = cols_by_constraint.get(uc, [])
-                if not ref_table or not ref_cols:
-                    continue
-                fks.setdefault(table_name, []).append(
-                    ForeignKey(
-                        columns=cols,
-                        foreign_table=ref_table,
-                        foreign_columns=ref_cols,
-                        constraint_name=cname,
-                    )
-                )
-        return pks, uniques, fks
-
-    def _build_table(
-        self,
-        *,
-        table_name: str,
-        is_view: bool,
-        comment: Optional[str],
-        columns: list[dict[str, Any]],
-        col_comments: dict[tuple[str, str], str],
-        pk: list[str],
-        unique_sets: list[list[str]],
-        fks: list[ForeignKey],
-    ) -> Table:
-        pk_set = set(pk)
-        single_unique = {u[0] for u in unique_sets if len(u) == 1}
-        if len(pk) == 1:
-            single_unique.add(pk[0])
-
-        built: list[Column] = []
-        for c in columns:
-            built.append(
-                Column(
-                    name=c["name"],
-                    data_type=c["data_type"],
-                    is_nullable=c["is_nullable"],
-                    is_primary_key=c["name"] in pk_set,
-                    is_unique=c["name"] in single_unique,
-                    default=c["default"],
-                    comment=col_comments.get((table_name, c["name"])),
-                    ordinal=c["ordinal"],
-                )
-            )
-
-        unique_sets_as_sets = [set(u) for u in unique_sets]
-        if pk:
-            unique_sets_as_sets.append(set(pk))
-        for fk in fks:
-            fk.is_unique = set(fk.columns) in unique_sets_as_sets
-
-        return Table(
-            name=table_name,
-            columns=built,
-            primary_key=pk,
-            foreign_keys=fks,
-            is_view=is_view,
-            comment=comment,
-            schema_name=self.schema_name,
-            unique_constraints=[list(u) for u in unique_sets],
-        )
+        return fold_constraints(tc, kcu, rc)

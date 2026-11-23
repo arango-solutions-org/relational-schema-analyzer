@@ -57,7 +57,8 @@ from ..bitemporal import CATALOG
 from ..bitemporal import to_iso as _iso
 from ..check_enum import enrich_check_constraint, parse_mysql_enum_type
 from ..log import get_logger
-from ..types import CheckConstraint, Column, ForeignKey, Schema, SourceProvenance, Table
+from ..types import CheckConstraint, Column, Schema, SourceProvenance, Table
+from .base import group_foreign_keys, mark_one_to_one, unique_columns
 
 logger = get_logger(__name__)
 
@@ -326,9 +327,7 @@ class MySQLConnector:
             # A view reports its source column's ENUM type too, but declares no constraint.
             checks.extend(_enum_column_checks(columns_data, checks))
 
-        single_unique = {u[0] for u in unique_sets if len(u) == 1}
-        if len(pks) == 1:
-            single_unique.add(pks[0])
+        single_unique = unique_columns(pks, unique_sets)
 
         columns = [
             Column(
@@ -344,28 +343,14 @@ class MySQLConnector:
             for c in columns_data
         ]
 
-        grouped: OrderedDict[str, dict[str, Any]] = OrderedDict()
-        for fk in fk_rows:
-            cname = fk["CONSTRAINT_NAME"]
-            bucket = grouped.setdefault(
-                cname,
-                {
-                    "columns": [],
-                    "foreign_table": fk["REFERENCED_TABLE_NAME"],
-                    "foreign_columns": [],
-                    "constraint_name": cname,
-                },
-            )
-            bucket["columns"].append(fk["COLUMN_NAME"])
-            bucket["foreign_columns"].append(fk["REFERENCED_COLUMN_NAME"])
-
-        fks = [ForeignKey(**v) for v in grouped.values()]
-
-        unique_col_sets = [set(u) for u in unique_sets]
-        if pks:
-            unique_col_sets.append(set(pks))
-        for fk in fks:
-            fk.is_unique = set(fk.columns) in unique_col_sets
+        fks = group_foreign_keys(
+            fk_rows,
+            constraint="CONSTRAINT_NAME",
+            column="COLUMN_NAME",
+            ref_table="REFERENCED_TABLE_NAME",
+            ref_column="REFERENCED_COLUMN_NAME",
+        )
+        mark_one_to_one(fks, pks, unique_sets)
 
         return Table(
             name=table_name,

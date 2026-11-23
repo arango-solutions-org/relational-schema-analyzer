@@ -31,7 +31,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ..log import get_logger
-from ..types import Column, ForeignKey, Schema, SourceProvenance, Table
+from ..types import ForeignKey, Schema, SourceProvenance
+from .base import build_table
 
 logger = get_logger(__name__)
 
@@ -109,11 +110,12 @@ class SqliteConnector:
         by_lower = {name.lower(): name for name in names}
         pks = {name: self._primary_key(columns[name]) for name in names}
         for name, kind in rows:
-            schema.tables[name] = self._build_table(
-                table_name=name,
+            schema.tables[name] = build_table(
+                name=name,
+                schema_name=self.schema_name,
                 is_view=(kind == "view"),
                 columns=columns[name],
-                pk=pks[name],
+                primary_key=pks[name],
                 unique_sets=self._unique_sets(conn, name) if kind == "table" else [],
                 fks=(
                     self._foreign_keys(conn, name, by_lower, columns, pks)
@@ -228,49 +230,3 @@ class SqliteConnector:
                 )
             )
         return fks
-
-    def _build_table(
-        self,
-        *,
-        table_name: str,
-        is_view: bool,
-        columns: list[dict[str, Any]],
-        pk: list[str],
-        unique_sets: list[list[str]],
-        fks: list[ForeignKey],
-    ) -> Table:
-        pk_set = set(pk)
-        single_unique = {u[0] for u in unique_sets if len(u) == 1}
-        if len(pk) == 1:
-            single_unique.add(pk[0])
-
-        built = [
-            Column(
-                name=c["name"],
-                data_type=c["data_type"],
-                is_nullable=c["is_nullable"],
-                is_primary_key=c["name"] in pk_set,
-                is_unique=c["name"] in single_unique,
-                default=c["default"],
-                comment=None,
-                ordinal=c["ordinal"],
-            )
-            for c in columns
-        ]
-
-        unique_sets_as_sets = [set(u) for u in unique_sets]
-        if pk:
-            unique_sets_as_sets.append(set(pk))
-        for fk in fks:
-            fk.is_unique = set(fk.columns) in unique_sets_as_sets
-
-        return Table(
-            name=table_name,
-            columns=built,
-            primary_key=pk,
-            foreign_keys=fks,
-            is_view=is_view,
-            comment=None,
-            schema_name=self.schema_name,
-            unique_constraints=[list(u) for u in unique_sets],
-        )

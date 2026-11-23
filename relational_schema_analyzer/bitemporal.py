@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from .log import get_logger
@@ -121,6 +122,17 @@ def to_iso(value: Any) -> Optional[str]:
             return None
     text = str(value).strip()
     return text or None
+
+
+def file_mtime_iso(path: Path) -> Optional[str]:
+    """A file's modification time as ISO-8601 UTC, or ``None`` if it cannot be read.
+
+    The valid time of a file-based source (CSV, OSI) that records no time of its own.
+    """
+    try:
+        return to_iso(path.stat().st_mtime)
+    except OSError:
+        return None
 
 
 #: Catalog timestamps older than this are treated as placeholders rather than facts.

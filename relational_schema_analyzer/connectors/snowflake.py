@@ -63,7 +63,7 @@ from ..bitemporal import CATALOG
 from ..bitemporal import to_iso as _iso
 from ..log import get_logger
 from ..types import Column, ForeignKey, Schema, SourceProvenance, Table
-from .base import quote_identifier
+from .base import mark_one_to_one, quote_identifier, unique_columns
 
 logger = get_logger(__name__)
 
@@ -242,21 +242,12 @@ class SnowflakeConnector:
         uniques = self._fetch_unique_constraints(conn, table_name)
 
         pk_set = set(pks)
-        # A column is unique if it's a single-column PK or a single-column UNIQUE key.
-        single_unique_cols = {u[0] for u in uniques if len(u) == 1}
-        if len(pks) == 1:
-            single_unique_cols.add(pks[0])
+        single_unique_cols = unique_columns(pks, uniques)
         for col in columns:
             col.is_primary_key = col.name in pk_set
             col.is_unique = col.name in single_unique_cols
 
-        # FK cardinality hint: the FK is 1:1 when its columns form a unique key
-        # (or the whole PK) on this table.
-        unique_sets = [set(u) for u in uniques]
-        if pks:
-            unique_sets.append(set(pks))
-        for fk in fks:
-            fk.is_unique = set(fk.columns) in unique_sets
+        mark_one_to_one(fks, pks, uniques)
 
         return Table(
             name=table_name,
