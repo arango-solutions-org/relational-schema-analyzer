@@ -32,6 +32,7 @@ import secrets
 import sys
 from typing import Any
 
+from .log import keep_logs_off_stdout
 from .tool import CONTRACT_VERSION, run_tool
 
 logger = logging.getLogger(__name__)
@@ -181,6 +182,8 @@ def serve(
     token: str | None = None,
 ) -> None:
     """Run the MCP server on the chosen transport."""
+    # Over stdio, stdout is the JSON-RPC channel: one log line there is a malformed message.
+    keep_logs_off_stdout()
     app_obj = build_app(host=host, port=port)
 
     if transport == "stdio":

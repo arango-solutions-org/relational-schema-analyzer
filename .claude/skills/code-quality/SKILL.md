@@ -72,8 +72,11 @@ breaks one of them is not a simplification. Do not flag or suggest removing:
   lists. Any change to what a schema serializes (a field, a key in `extra`, a
   default) changes `fingerprint_physical_schema`. That is a release decision, not
   a cleanup.
-- **Stdout carries only the bundle.** Logs go to stderr in `cli.py` and
-  `mcp_server.py` (#38, `tests/test_cli_stdout_is_only_the_bundle.py`).
+- **Stdout carries only RSA's output.** `log.keep_logs_off_stdout`, called by
+  `cli.main` and `mcp_server.serve`, sends logs to stderr: the CLI's stdout is the
+  bundle, and the stdio MCP server's is the JSON-RPC channel (#38;
+  `tests/test_cli_stdout_is_only_the_bundle.py`,
+  `tests/test_mcp_stdout_is_only_protocol.py`). Any new entry point must call it.
 
 Two more rules decide whether something counts as a finding:
 
