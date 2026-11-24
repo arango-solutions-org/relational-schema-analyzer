@@ -448,7 +448,7 @@ datasets declare nothing even though the dialect supports constraints — yield 
 but no keys. That is fatal to the conceptual layer rather than merely lossy: `fk_inference`
 indexes candidate *targets* by declared primary key, so a schema with no PKs produces no
 relationships at all. The answer is a **declared-key overlay** (`overlay.py`,
-`--overlay FILE`): human-supplied PK/FK/UNIQUE merged onto a `PhysicalSchema`, where the
+`--overlay FILE`, or `analysisOptions.keyOverlay` in the tool contract): human-supplied PK/FK/UNIQUE merged onto a `PhysicalSchema`, where the
 catalog always wins, overlay keys stay labelled (`enforced=False`, `overlay:`-prefixed
 constraint names, an `overlay_declared_keys` pattern) so consumers can distinguish declared
 from overlaid from inferred, and a typo is an error rather than a silent no-op. It is

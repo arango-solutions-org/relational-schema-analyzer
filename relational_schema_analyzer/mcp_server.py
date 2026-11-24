@@ -88,12 +88,19 @@ def _install_auth(app: Any, expected_token: str) -> None:
     app.add_middleware(BaseHTTPMiddleware, dispatch=dispatch)
 
 
-def _typed_request(operation: str, **fields: Any) -> dict[str, Any]:
-    """Build a v1 request dict for one operation, dropping unset (None) fields."""
+def _typed_request(
+    operation: str, *, key_overlay: dict[str, Any] | None = None, **fields: Any
+) -> dict[str, Any]:
+    """Build a v1 request dict for one operation, dropping unset (None) fields.
+
+    ``key_overlay`` travels as ``analysisOptions.keyOverlay``.
+    """
     req: dict[str, Any] = {"contractVersion": CONTRACT_VERSION, "operation": operation}
     for key, value in fields.items():
         if value is not None:
             req[key] = value
+    if key_overlay is not None:
+        req["analysisOptions"] = {"keyOverlay": key_overlay}
     return req
 
 
@@ -129,45 +136,68 @@ def build_app(*, host: str | None = None, port: int | None = None) -> Any:
         return run_tool(req)
 
     @mcp.tool()
-    def relational_schema_analyzer_snapshot(source: dict[str, Any]) -> dict[str, Any]:
-        """Physical-schema snapshot. ``source`` = {type, url, schema?, params?}."""
-        return run_tool(_typed_request("snapshot", source=source))
+    def relational_schema_analyzer_snapshot(
+        source: dict[str, Any], key_overlay: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Physical-schema snapshot. ``source`` = {type, url, schema?, params?}.
+
+        ``key_overlay`` = {version?: 1, tables: {name: {primaryKey?, uniqueConstraints?,
+        foreignKeys?}}} declares keys the source's catalog lacks (BigQuery, Glue, Hive).
+        """
+        return run_tool(_typed_request("snapshot", source=source, key_overlay=key_overlay))
 
     @mcp.tool()
     def relational_schema_analyzer_analyze(
-        source: dict[str, Any] | None = None, input: dict[str, Any] | None = None
+        source: dict[str, Any] | None = None,
+        input: dict[str, Any] | None = None,
+        key_overlay: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Analyze a source (or a captured ``input.physical``) into the bundle.
 
         Pass a previous run's bundle as ``input.previousAnalysis`` to enable bitemporal
         fingerprint-continuity: without it the valid time of an unchanged schema can only be
         reported as ``observed`` (or an ungated catalog date), never carried back to when the
-        definition actually became true.
+        definition actually became true. ``key_overlay`` declares keys the source's catalog
+        lacks; see the snapshot tool.
         """
-        return run_tool(_typed_request("analyze", source=source, input=input))
+        return run_tool(
+            _typed_request("analyze", source=source, input=input, key_overlay=key_overlay)
+        )
 
     @mcp.tool()
     def relational_schema_analyzer_owl(
         source: dict[str, Any] | None = None,
         input: dict[str, Any] | None = None,
         owl: dict[str, Any] | None = None,
+        key_overlay: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """OWL export. ``owl`` = {format: turtle|jsonld, iriBase?, physIriBase?}."""
-        return run_tool(_typed_request("owl", source=source, input=input, owl=owl))
+        """OWL export. ``owl`` = {format: turtle|jsonld, iriBase?, physIriBase?}.
+
+        ``key_overlay`` declares keys the source's catalog lacks; see the snapshot tool.
+        """
+        return run_tool(
+            _typed_request("owl", source=source, input=input, owl=owl, key_overlay=key_overlay)
+        )
 
     @mcp.tool()
     def relational_schema_analyzer_r2rml(
         source: dict[str, Any] | None = None,
         input: dict[str, Any] | None = None,
         r2rml: dict[str, Any] | None = None,
+        key_overlay: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """R2RML mapping export (Turtle).
 
         ``r2rml`` = {iriBase?, dataIriBase?, mappingIriBase?}. Pair it with the
         ``owl`` tool using the same ``iriBase`` to get an ontology plus a mapping
         that populates it — a virtual knowledge graph over the live database.
+        ``key_overlay`` declares keys the source's catalog lacks; see the snapshot tool.
         """
-        return run_tool(_typed_request("r2rml", source=source, input=input, r2rml=r2rml))
+        return run_tool(
+            _typed_request(
+                "r2rml", source=source, input=input, r2rml=r2rml, key_overlay=key_overlay
+            )
+        )
 
     return mcp
 
