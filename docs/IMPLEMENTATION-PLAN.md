@@ -809,13 +809,28 @@ projection — the whole core (Phases 0–5) landed together in the first releas
     and Turtle and R2RML are byte-identical. arango-schema-analyzer has the same fix
     (its PR #79). Open PR #49 (OWL import) needs one test updated when it rebases.
 
+- **v0.16.0** — **no connection error can print a credential.** A minor version because
+  connection error messages change shape: they now name the driver's error type.
+  - *Credentials masked everywhere* (#57, PR #78). Only Snowflake used to mask. The other
+    connectors put the driver's error text in their message and chained the driver's
+    exception, which any traceback prints raw. Whether that leaked a password depended
+    on the driver. The new dependency-free `redact.py` collects the credentials in a
+    connection string or parameter dict (raw, decoded and percent-encoded), masks them as
+    `***`, and builds the error to raise `from None`:
+    `"Failed to connect to MySQL: OperationalError: <masked driver text>"`. Every
+    connector's connect path uses it (Postgres, MySQL, SQL Server, Databricks, Snowflake,
+    and DuckDB for a MotherDuck token), as do the bulk-read sessions and the samplers'
+    log lines. Snowflake's old helper missed a percent-encoded password; it is replaced.
+    r2g's own connector copies have the same gap: r2g-arango#118.
+
 Planned next:
 
 - **mcp 2.0 port** — the `[mcp]` extra is pinned `<2` because mcp 2.0 removed the bundled
   `mcp.server.fastmcp` in favour of a new `MCPServer` API (FastMCP moved to its own package).
   `mcp_server.py` targets the 1.x FastMCP API. Porting it is a contained piece of work; until
   then the pin is what keeps the extra installable.
-- **v0.16.0 (target; was v0.15.0 until the probe and JSON-LD release took that one, v0.14.0
+- **v0.17.0 (target; was v0.16.0 until the credential-masking release took that one, v0.15.0
+  until the probe and JSON-LD release took that one, v0.14.0
   until the key-overlay release took that one, v0.13.0 until the audit-fix release took that one, v0.12.0 until the SQLite release took that one, v0.10.0 and v0.11.0
   until the singularizer releases took those numbers, v0.9.0 until key discovery took that one, and v0.8.0 before bitemporal stamping
   took that one)** — the

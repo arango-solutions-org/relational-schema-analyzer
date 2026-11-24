@@ -185,7 +185,7 @@
     "generator": "relational-schema-analyzer",
     "physicalSchemaFingerprint": "sha256-9a979e556be2d0cfd4befa39235bd2f1bda9403362cd58f02f97b80856fc8176",
     "reviewRequired": true,
-    "version": "0.15.0",
+    "version": "0.16.0",
     "warnings": []
   },
   "physicalMapping": {

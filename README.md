@@ -34,7 +34,7 @@ flowchart TD
 
 ## Status
 
-Active development — **v0.15.0 on [PyPI](https://pypi.org/project/relational-schema-analyzer/)**
+Active development — **v0.16.0 on [PyPI](https://pypi.org/project/relational-schema-analyzer/)**
 (`pip install relational-schema-analyzer`). All core phases (0–5) are implemented: the
 physical core (connectors, types, FK inference) extracted from `r2g`; a deterministic
 conceptual baseline that emits a contract-valid `{conceptualSchema, physicalMapping, metadata}`
