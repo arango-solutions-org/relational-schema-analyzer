@@ -61,6 +61,7 @@ _PG_DDL = [
             id INT PRIMARY KEY, name TEXT, zip TEXT, city TEXT, state TEXT,
             tags TEXT, plan_code TEXT, region_code TEXT)""",
     f"INSERT INTO {SCHEMA}.customers VALUES {_ROWS}",
+    f"ALTER TABLE {SCHEMA}.customers ADD COLUMN ghost TEXT",  # #62: never holds a value
 ]
 
 # MySQL has no CREATE SCHEMA distinct from CREATE DATABASE, and the sampler's
@@ -79,6 +80,7 @@ _MYSQL_DDL = [
            state VARCHAR(10), tags VARCHAR(80), plan_code VARCHAR(20),
            region_code VARCHAR(20))""",
     f"INSERT INTO customers VALUES {_ROWS}",
+    "ALTER TABLE customers ADD COLUMN ghost VARCHAR(20)",  # #62: never holds a value
 ]
 
 _MYSQL_TEARDOWN = [
@@ -103,6 +105,7 @@ _MSSQL_DDL = [
            state NVARCHAR(10), tags NVARCHAR(80), plan_code NVARCHAR(20),
            region_code NVARCHAR(20))""",
     f"INSERT INTO customers VALUES {_ROWS}",
+    "ALTER TABLE customers ADD ghost NVARCHAR(20)",  # #62: never holds a value
 ]
 
 _MSSQL_TEARDOWN = _MYSQL_TEARDOWN
@@ -222,6 +225,16 @@ class TestDenormalizationProbesLive:
     def test_delimiter_rate(self, sampler):
         assert sampler.delimiter_rate("customers", "tags", ",") == 0.5
         assert sampler.delimiter_rate("customers", "city", ",") == 0.0
+
+    def test_an_empty_column_is_not_measured(self, sampler):
+        """#62: no value to measure is None on every engine, not a 0.0 on most of them."""
+        assert sampler.distinct_ratio("customers", "ghost") is None
+        assert sampler.delimiter_rate("customers", "ghost", ",") is None
+        assert sampler.group_single_valued("customers", ["ghost"], "city") is None
+
+    def test_delimiter_rate_reads_a_non_text_column(self, sampler):
+        """A measured zero, not a failed query: Postgres's strpos refuses an integer."""
+        assert sampler.delimiter_rate("customers", "id", ",") == 0.0
 
     def test_probes_degrade_to_none_on_missing_table(self, sampler):
         assert sampler.distinct_ratio("nosuchtable", "plan_code") is None

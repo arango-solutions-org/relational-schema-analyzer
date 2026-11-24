@@ -91,6 +91,15 @@ def test_empty_local_column_is_not_evaluated(conn):
     assert _sampler(conn)("EMPTY_T", "V", "PARENT", "ID") is None
 
 
+def test_denormalization_probes_on_an_empty_column_are_not_measured(conn):
+    # #62: COALESCE(..., 0) and GREATEST(COUNT(*), 1) made these 0.0, a measurement.
+    s = _sampler(conn)
+    assert s.distinct_ratio("EMPTY_T", "V") is None
+    assert s.delimiter_rate("EMPTY_T", "V", ",") is None
+    assert s.group_single_valued("EMPTY_T", ["V"], "V") is None
+    assert s.delimiter_rate("CHILD", "REGION", ",") == pytest.approx(0.0)  # a real zero
+
+
 def test_a_failing_probe_returns_none(conn):
     assert _sampler(conn)("NO_SUCH_TABLE", "X", "PARENT", "ID") is None
 
