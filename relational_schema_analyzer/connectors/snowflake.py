@@ -62,6 +62,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from ..bitemporal import CATALOG
 from ..bitemporal import to_iso as _iso
 from ..log import get_logger
+from ..redact import connection_error, secrets_in
 from ..types import Column, ForeignKey, Schema, SourceProvenance, Table
 from .base import mark_one_to_one, quote_identifier, unique_columns
 
@@ -131,8 +132,8 @@ class SnowflakeConnector:
         try:
             conn = snowflake.connect(**connect_kwargs)
         except Exception as err:
-            raise RuntimeError(
-                f"Failed to connect to Snowflake: {_safe_connection_error(err, connect_kwargs)}"
+            raise connection_error(
+                "Failed to connect to Snowflake", err, secrets_in(connect_kwargs, self.connection_string)
             ) from None
 
         try:
@@ -439,23 +440,6 @@ def _safe_int(v: Any) -> int:
         return 0
 
 
-_SENSITIVE_CONNECT_FIELDS = ("password", "private_key_file", "private_key_file_pwd")
-
-
-def _safe_connection_error(err: Exception, connect_params: dict[str, Any]) -> str:
-    """The driver's error with any password, key path or key passphrase masked.
-
-    Snowflake driver errors can echo connection parameters; a key-file path in a
-    log or an API response discloses where the credential lives.
-    """
-    message = str(err)
-    for field in _SENSITIVE_CONNECT_FIELDS:
-        value = connect_params.get(field)
-        if value:
-            message = message.replace(str(value), "***")
-    return message
-
-
 def _parse_snowflake_url(url: str) -> dict[str, Any]:
     """Parse a Snowflake SQLAlchemy-style URL into connector kwargs.
 
@@ -580,8 +564,9 @@ class SnowflakeSession:
             try:
                 self._conn = snowflake.connect(**self._connect_params)
             except Exception as err:
-                safe = _safe_connection_error(err, self._connect_params)
-                raise RuntimeError(f"Failed to connect to Snowflake: {safe}") from None
+                raise connection_error(
+                    "Failed to connect to Snowflake", err, secrets_in(self._connect_params, self.connection_string)
+                ) from None
             try:
                 cur = self._conn.cursor()
                 try:

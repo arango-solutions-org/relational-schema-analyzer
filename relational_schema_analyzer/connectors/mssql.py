@@ -62,6 +62,7 @@ from ..bitemporal import to_iso as _iso
 from ..check_enum import enrich_check_constraint
 from ..log import get_logger
 from ..quoting import quote_bracket
+from ..redact import connection_error, secrets_in
 from ..types import CheckConstraint, Column, Schema, SourceProvenance, Table
 from .base import group_foreign_keys, mark_one_to_one, unique_columns
 
@@ -148,7 +149,9 @@ class SQLServerConnector:
         try:
             return pymssql.connect(**self._connect_params)
         except Exception as err:
-            raise RuntimeError(f"Failed to connect to SQL Server: {err}") from err
+            raise connection_error(
+                "Failed to connect to SQL Server", err, secrets_in(self._connect_params, self.connection_string)
+            ) from None
 
     def open_session(self) -> "SQLServerSession":
         """Open a bulk-read session for streaming / dumps."""
@@ -542,7 +545,9 @@ class SQLServerSession:
             try:
                 self._conn = pymssql.connect(**self._connect_params)
             except Exception as err:
-                raise RuntimeError(f"Failed to connect to SQL Server: {err}") from err
+                raise connection_error(
+                    "Failed to connect to SQL Server", err, secrets_in(self._connect_params, self.connection_string)
+                ) from None
         return self._conn
 
     def close(self) -> None:
