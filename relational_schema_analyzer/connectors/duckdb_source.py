@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ..log import get_logger
+from ..redact import connection_error, secrets_in
 from ..types import ForeignKey, Schema, SourceProvenance
 from .base import build_table, fold_constraints
 
@@ -52,7 +53,9 @@ class DuckDbConnector:
         try:
             conn = duckdb.connect(self.connection_string, read_only=True)
         except Exception as err:
-            raise RuntimeError(f"Failed to open DuckDB database: {err}") from err
+            raise connection_error(
+                "Failed to open DuckDB database", err, secrets_in(self.connection_string)
+            ) from None
         try:
             return self._introspect(conn)
         finally:

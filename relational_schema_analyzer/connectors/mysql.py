@@ -58,6 +58,7 @@ from ..bitemporal import to_iso as _iso
 from ..check_enum import enrich_check_constraint, parse_mysql_enum_type
 from ..log import get_logger
 from ..quoting import quote_backtick
+from ..redact import connection_error, secrets_in
 from ..types import CheckConstraint, Column, Schema, SourceProvenance, Table
 from .base import group_foreign_keys, mark_one_to_one, unique_columns
 
@@ -165,7 +166,9 @@ class MySQLConnector:
                 **self._connect_params,
             )
         except Exception as err:
-            raise RuntimeError(f"Failed to connect to MySQL: {err}") from err
+            raise connection_error(
+                "Failed to connect to MySQL", err, secrets_in(self._connect_params, self.connection_string)
+            ) from None
 
     def open_session(self) -> "MySQLSession":
         """Open a consistent-snapshot read session for streaming / dumps."""
@@ -504,7 +507,9 @@ class MySQLSession:
             try:
                 self._conn = pymysql.connect(**params)
             except Exception as err:
-                raise RuntimeError(f"Failed to connect to MySQL: {err}") from err
+                raise connection_error(
+                    "Failed to connect to MySQL", err, secrets_in(self._connect_params, self.connection_string)
+                ) from None
             with self._conn.cursor() as cur:
                 cur.execute("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ")
                 cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT")

@@ -33,6 +33,7 @@ from ..bitemporal import EVENT
 from ..bitemporal import to_iso as _iso
 from ..check_enum import enrich_check_constraint
 from ..log import get_logger
+from ..redact import connection_error, secrets_in
 from ..types import CheckConstraint, Column, ForeignKey, Schema, SourceProvenance, Table
 from .base import group_foreign_keys, mark_one_to_one, quote_identifier, unique_columns
 
@@ -198,7 +199,11 @@ class PostgresConnector:
                     partition_rows = cur.fetchall()
 
         except Exception as e:
-            raise RuntimeError(f"Failed to fetch schema from PostgreSQL: {e}")
+            # ``from None``: the driver's exception would otherwise print in any traceback,
+            # unmasked (#57). Without it the raise also chained implicitly.
+            raise connection_error(
+                "Failed to fetch schema from PostgreSQL", e, secrets_in(self.connection_string)
+            ) from None
 
         annotate_partition_metadata(schema, partition_rows)
         return schema
@@ -529,11 +534,16 @@ class PostgresSession:
     @property
     def connection(self) -> "psycopg.Connection[dict[str, Any]]":
         if self._conn is None:
-            self._conn = psycopg.connect(
-                self.connection_string,
-                row_factory=dict_row,
-                autocommit=False,
-            )
+            try:
+                self._conn = psycopg.connect(
+                    self.connection_string,
+                    row_factory=dict_row,
+                    autocommit=False,
+                )
+            except Exception as err:
+                raise connection_error(
+                    "Failed to connect to PostgreSQL", err, secrets_in(self.connection_string)
+                ) from None
             self._conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         return self._conn
 

@@ -101,6 +101,7 @@ from pydantic import BaseModel, Field
 
 from .log import get_logger
 from .quoting import quote_ansi, quote_backtick, quote_bracket
+from .redact import connection_error, redact, secrets_in
 from .typemap import pg_type_to_json_type
 from .types import Column, ForeignKey, Schema, Table
 
@@ -218,6 +219,19 @@ _STRICT_IS_CONCLUSIVE = 0.9
 def _conclusive(exact: Optional[float]) -> bool:
     """Is the strict overlap good enough that normalizing cannot change the outcome?"""
     return exact is not None and exact >= _STRICT_IS_CONCLUSIVE
+
+
+def _masked(sampler: Any, err: BaseException) -> str:
+    """``str(err)`` with the sampler's credentials masked, for a log line (#57).
+
+    A driver's error can repeat the password or token it was given, and these warnings go
+    to whatever collects the logs. The secrets come from the sampler's own connection
+    string and parameters; a plain callable sampler has neither, so its text is unchanged.
+    """
+    secrets = secrets_in(
+        getattr(sampler, "connection_string", None), getattr(sampler, "_connect_params", None)
+    )
+    return redact(str(err), secrets)
 
 
 def _better(exact: Optional[float], norm: Optional[float]) -> Optional[Overlap]:
@@ -827,7 +841,7 @@ def _apply_sampler(
                 table=c.table,
                 column=lcol,
                 foreign_table=c.foreign_table,
-                error=str(err),
+                error=_masked(sampler, err),
             )
             return c  # keep candidate; sampler noise shouldn't drop it
         if score is None:
@@ -994,7 +1008,7 @@ class PostgresValueSampler:
         try:
             conn = self._conn_lazy()
         except Exception as err:  # noqa: BLE001
-            self._connect_error = str(err)
+            self._connect_error = _masked(self, err)
             logger.warning(
                 f"{what}_connect_failed",
                 error=self._connect_error,
@@ -1008,7 +1022,7 @@ class PostgresValueSampler:
                 row = cur.fetchone()
             return tuple(row) if row else None
         except Exception as err:  # noqa: BLE001
-            logger.warning(f"{what}_query_failed", error=str(err))
+            logger.warning(f"{what}_query_failed", error=_masked(self, err))
             try:
                 conn.rollback()  # a failed statement poisons the transaction otherwise
             except Exception:  # noqa: BLE001
@@ -1267,12 +1281,12 @@ class _SqlSampler:
         try:
             conn = self._conn_lazy()
         except Exception as err:  # noqa: BLE001
-            logger.warning(f"{self._log_name}_connect_failed", error=str(err))
+            logger.warning(f"{self._log_name}_connect_failed", error=_masked(self, err))
             return None
         try:
             return self._fetch_first(conn, query, params)
         except Exception as err:  # noqa: BLE001
-            logger.warning(f"{self._log_name}_query_failed", error=str(err))
+            logger.warning(f"{self._log_name}_query_failed", error=_masked(self, err))
             return None
 
     def _scalar(self, query: str, params: tuple) -> SamplerResult:
@@ -2165,7 +2179,7 @@ class SnowflakeValueSampler:
 
     def _conn_lazy(self) -> Any:
         if self._conn is None:
-            from .connectors.snowflake import _load_snowflake_connector, _safe_connection_error
+            from .connectors.snowflake import _load_snowflake_connector
 
             params = dict(self._connect_params)
             params.setdefault("schema", self.schema_name)
@@ -2175,8 +2189,8 @@ class SnowflakeValueSampler:
             except Exception as err:
                 # ``from None``: the driver's original error can echo the password
                 # or key path, and a chained __cause__ is printed by any traceback.
-                raise RuntimeError(
-                    f"Failed to connect to Snowflake: {_safe_connection_error(err, params)}"
+                raise connection_error(
+                    "Failed to connect to Snowflake", err, secrets_in(params)
                 ) from None
         if self._owns_conn and not self._session_ready:
             self._session_ready = True
@@ -2196,7 +2210,7 @@ class SnowflakeValueSampler:
                     finally:
                         cur.close()
                 except Exception as err:  # noqa: BLE001
-                    logger.warning("snowflake_sampler_session_setting_skipped", error=str(err))
+                    logger.warning("snowflake_sampler_session_setting_skipped", error=_masked(self, err))
         return self._conn
 
     # ── governed execution ──
@@ -2219,7 +2233,7 @@ class SnowflakeValueSampler:
         except Exception as err:  # noqa: BLE001
             # One attempt per sampler: retrying per probe turns a bad credential
             # into hundreds of failed logins, enough to lock the service user out.
-            self._connect_error = str(err)
+            self._connect_error = _masked(self, err)
             logger.warning(
                 "fk_sampler_connect_failed",
                 error=self._connect_error,
@@ -2235,7 +2249,7 @@ class SnowflakeValueSampler:
             finally:
                 cur.close()
         except Exception as err:  # noqa: BLE001
-            logger.warning("snowflake_sampler_query_failed", error=str(err))
+            logger.warning("snowflake_sampler_query_failed", error=_masked(self, err))
             return None
 
     _ident = staticmethod(quote_ansi)

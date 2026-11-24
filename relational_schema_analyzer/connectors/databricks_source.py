@@ -34,6 +34,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from ..bitemporal import CATALOG
 from ..bitemporal import to_iso as _iso
 from ..log import get_logger
+from ..redact import connection_error, secrets_in
 from ..types import ForeignKey, Schema, SourceProvenance
 from .base import build_table, fold_constraints
 
@@ -109,7 +110,11 @@ class DatabricksConnector:
                 catalog=self.catalog, schema=self.schema_name, **self._connect_params
             )
         except Exception as err:
-            raise RuntimeError(f"Failed to connect to Databricks: {err}") from err
+            raise connection_error(
+                "Failed to connect to Databricks",
+                err,
+                secrets_in(self._connect_params, self.connection_string),
+            ) from None
         try:
             cur = conn.cursor()
             try:
