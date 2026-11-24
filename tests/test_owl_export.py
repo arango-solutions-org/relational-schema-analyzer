@@ -123,7 +123,7 @@ class TestJsonLd:
         assert doc["@context"]["phys"] == PHYS
         assert doc["@context"]["@vocab"] == REL
         ids = {n["@id"] for n in doc["@graph"]}
-        assert {"Users", "Orders", "Orders_Users", "Users_id"} <= ids
+        assert {REL + n for n in ("Users", "Orders", "Orders_Users", "Users_id")} <= ids
 
     def test_jsonld_parses_as_rdf(self):
         doc = export_owl_jsonld(RelationalSchemaAnalyzer().analyze(_basic_schema()))
@@ -135,36 +135,48 @@ class TestJsonLd:
 
 
 class TestJsonLdStatesWhatTurtleStates:
-    """Both formats render one model, so they state the same facts (#53).
+    """Both formats render one model, so they state the same facts about the same resources.
 
     JSON-LD used to walk the bundle separately and dropped a join table's parent columns
-    and a relationship's schema, which Turtle had. Resources are compared by local name:
-    JSON-LD ``@id`` values are relative and resolve against the document rather than the
-    base IRI (#63). Tighten this to full IRIs when that is fixed.
+    and a relationship's schema, which Turtle had (#53). It also wrote ``@id`` as a bare
+    local name, a relative IRI that a JSON-LD processor resolves against the document's
+    location, so its resources were not Turtle's (#63). Triples are compared whole, with
+    full IRIs; only the Turtle-only header (ontology, annotation-property declarations) is
+    left out.
     """
 
-    _VOCABULARIES = (OWL, RDFS, PHYS, str(rdflib.RDF), str(rdflib.XSD))
-
-    @classmethod
-    def _facts(cls, graph) -> set:
-        def norm(term):
-            if isinstance(term, rdflib.URIRef) and not str(term).startswith(cls._VOCABULARIES):
-                return str(term).rsplit("#", 1)[-1].rsplit("/", 1)[-1]
-            return term
-
+    @staticmethod
+    def _facts(graph) -> set:
         header = {
             s
             for s, _, o in graph.triples((None, rdflib.RDF.type, None))
             if o in (rdflib.OWL.Ontology, rdflib.OWL.AnnotationProperty)
         }
-        return {tuple(norm(t) for t in triple) for triple in graph if triple[0] not in header}
+        return {triple for triple in graph if triple[0] not in header}
 
-    def _both(self, schema):
+    def _both(self, schema, **iris):
         import json
 
         analysis = RelationalSchemaAnalyzer().analyze(schema)
-        jsonld = rdflib.Graph().parse(data=json.dumps(export_owl_jsonld(analysis)), format="json-ld")
-        return self._facts(_graph(export_owl_turtle(analysis))), self._facts(jsonld)
+        jsonld = json.dumps(export_owl_jsonld(analysis, **iris))
+        # A base the document must not need: every id has to be absolute already.
+        parsed = rdflib.Graph().parse(data=jsonld, format="json-ld", publicID="urn:x-elsewhere:")
+        return self._facts(_graph(export_owl_turtle(analysis, **iris))), self._facts(parsed)
+
+    @pytest.mark.parametrize(
+        "iris",
+        [{}, {"base_iri": "http://example.org/c#", "phys_iri": "http://example.org/p#"}],
+        ids=["default-iris", "custom-iris"],
+    )
+    def test_the_same_resources_whatever_the_document_location(self, iris):
+        turtle, jsonld = self._both(_join_schema(), **iris)
+        assert jsonld, "nothing parsed"
+        assert turtle == jsonld
+        base = iris.get("base_iri", REL)
+        subjects = {str(s) for s, _, _ in jsonld}
+        assert all(s.startswith(base) for s in subjects), subjects - {
+            s for s in subjects if s.startswith(base)
+        }
 
     @pytest.mark.parametrize("schema", [_basic_schema, _join_schema], ids=["fk", "join"])
     def test_the_same_facts(self, schema):
@@ -180,7 +192,7 @@ class TestJsonLdStatesWhatTurtleStates:
         for table in built.tables.values():
             table.schema_name = "school"
         doc = export_owl_jsonld(RelationalSchemaAnalyzer().analyze(built))
-        (rel,) = [n for n in doc["@graph"] if n["@id"] == "Students_Courses"]
+        (rel,) = [n for n in doc["@graph"] if n["@id"] == REL + "Students_Courses"]
         assert rel["phys:joinFromParentColumns"] == ["id"]
         assert rel["phys:joinToParentColumns"] == ["id"]
         assert rel["phys:schemaName"] == "school"
