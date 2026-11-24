@@ -198,7 +198,8 @@ and the bundle reports an `overlay_declared_keys` pattern, so a consumer can alw
 catalog-declared from human-declared from inferred. **A typo fails loudly** — unknown tables,
 unknown columns and misspelled keys are errors, because an overlay that silently does nothing
 is worse than none at all. `--overlay` works on every subcommand, with a live source or
-`--from-snapshot`; YAML overlays need PyYAML.
+`--from-snapshot`; YAML overlays need PyYAML. Tool-contract callers pass the same document
+as `analysisOptions.keyOverlay`, and the MCP tools take it as `key_overlay`.
 
 **Consumer metadata passthrough (0.2.0).** `Column` and `Table` carry an optional
 `extra: dict` that the analyzer never reads or interprets — it only guarantees the

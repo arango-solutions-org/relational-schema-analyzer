@@ -22,6 +22,9 @@ Request shape (relational variant of the shared tool contract):
         "previousAnalysis": { ... }     # optional: a previous run's bundle, enabling
                                         # bitemporal fingerprint-continuity (see below)
       },
+      "analysisOptions": {
+        "keyOverlay": { ... }           # optional: human-declared keys (see below)
+      },
       "owl": { "format": "turtle"|"jsonld", "iriBase": "...", "physIriBase": "..." },
       "r2rml": { "iriBase": "...", "dataIriBase": "...", "mappingIriBase": "..." }
     }
@@ -42,6 +45,15 @@ The field name is deliberately **not** a new one: ``input.previousAnalysis`` is 
 declared in the shared request contract (and ``input`` is ``additionalProperties: false``,
 so a minted ``priorRun`` would have been rejected outright by any validating consumer).
 Reusing it keeps RSA and ``arango-schema-analyzer`` converged on a field that predates both.
+
+``analysisOptions.keyOverlay`` is the contract-level equivalent of the CLI's ``--overlay``:
+an overlay document (the format in :mod:`.overlay`) supplying primary, foreign and unique
+keys for a source whose catalog declares none. It is applied the same way to a live source
+and to ``input.physical``. A bad overlay (an unknown table or column, an unknown key) fails
+the request with ``INVALID_REQUEST``, never silently does nothing. It sits in
+``analysisOptions`` because that is where arango-schema-analyzer's contract carries its own
+curator declarations (``declaredReferences``); a different name, because ASA verifies those
+against the database while an overlay is asserted, not verified (#71).
 
 Response envelope (aligned with the shared response contract):
 
@@ -92,10 +104,12 @@ def _load_physical(request: dict[str, Any]) -> PhysicalSchema:
     given = request.get("input") or {}
     previous = given.get("previousAnalysis") if isinstance(given, dict) else None
     prior = PriorRun.from_metadata(previous) if isinstance(previous, dict) else None
+    options = request.get("analysisOptions")
+    overlay = options.get("keyOverlay") if isinstance(options, dict) else None
 
     if isinstance(given, dict) and given.get("physical") is not None:
         captured = PhysicalSchema.model_validate(given["physical"])
-        return load_physical(captured=captured, prior=prior)
+        return load_physical(captured=captured, overlay=overlay, prior=prior)
 
     source = request.get("source")
     if not isinstance(source, dict) or not source.get("type") or not source.get("url"):
@@ -105,6 +119,7 @@ def _load_physical(request: dict[str, Any]) -> PhysicalSchema:
         url=source["url"],
         schema_name=source.get("schema", "public"),
         source_params=source.get("params"),
+        overlay=overlay,
         prior=prior,
     )
 

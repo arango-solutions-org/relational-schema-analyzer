@@ -141,7 +141,8 @@
             "entities": { "type": "array", "maxItems": 50000, "items": { "type": "object" } },
             "relationships": { "type": "array", "maxItems": 50000, "items": { "type": "object" } }
           }
-        }
+        },
+        "keyOverlay": { "$ref": "#/$defs/KeyOverlay" }
       }
     },
 
@@ -184,6 +185,61 @@
   },
 
   "$defs": {
+    "KeyOverlay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tables"],
+      "description": "Relational only (#71). Human-declared primary, foreign and unique keys for a source whose catalog declares none (BigQuery, Glue, Hive), merged before analysis: the contract-level equivalent of the CLI's --overlay, applied the same way to a live source and to input.physical. The catalog always wins; overlay foreign keys are emitted enforced=false with an 'overlay:' constraint name, and the bundle gains the overlay_declared_keys pattern. An unknown table, column or key fails the request with INVALID_REQUEST. Asserted, not verified, unlike arango-schema-analyzer's analysisOptions.declaredReferences.",
+      "properties": {
+        "version": { "const": 1 },
+        "description": { "type": "string" },
+        "comment": { "type": "string" },
+        "tables": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/KeyOverlayTable" }
+        }
+      }
+    },
+    "KeyOverlayTable": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "primaryKey": { "$ref": "#/$defs/KeyOverlayColumns" },
+        "uniqueConstraints": { "type": "array", "items": { "$ref": "#/$defs/KeyOverlayColumns" } },
+        "foreignKeys": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["columns", "references"],
+            "properties": {
+              "columns": { "$ref": "#/$defs/KeyOverlayColumns" },
+              "references": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["table", "columns"],
+                "properties": {
+                  "table": { "type": "string", "minLength": 1 },
+                  "columns": { "$ref": "#/$defs/KeyOverlayColumns" },
+                  "description": { "type": "string" },
+                  "comment": { "type": "string" }
+                }
+              },
+              "constraintName": { "type": "string" },
+              "description": { "type": "string" },
+              "comment": { "type": "string" }
+            }
+          }
+        },
+        "description": { "type": "string" },
+        "comment": { "type": "string" }
+      }
+    },
+    "KeyOverlayColumns": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
     "PhysicalSnapshot": {
       "type": "object",
       "description": "Physical schema snapshot as produced by snapshot_physical_schema(). Hosts that expose this contract to untrusted callers SHOULD enforce a request-body size cap at the transport layer (e.g. a few MiB); the analyzer treats nested fields as trusted snapshot data.",
