@@ -282,24 +282,39 @@ def _turtle_node(node: _Node) -> list[str]:
     return out
 
 
-def _jsonld_value(value: Any) -> Any:
+def _jsonld_value(value: Any, base_iri: str) -> Any:
     if isinstance(value, _Iri):
-        return {"@id": value.ref[1:] if value.ref.startswith(":") else value.ref}
+        return {"@id": _jsonld_iri(value.ref, base_iri)}
     return list(value) if isinstance(value, list) else value
 
 
-def _jsonld_node(node: _Node) -> dict[str, Any]:
-    out: dict[str, Any] = {"@id": node.local, "@type": node.types, "rdfs:label": node.label}
+def _jsonld_iri(ref: str, base_iri: str) -> str:
+    """A full IRI for this ontology's ``:Local`` names; prefixed names (``xsd:``) as they are.
+
+    A bare local name as ``@id`` is a *relative* IRI. ``@vocab`` covers property and type
+    names only, so a JSON-LD processor resolved ``Thing_1`` against the document's own
+    location, and the JSON-LD and Turtle exports described different resources (#63).
+    ``@base`` cannot fix it: resolving against ``…/relational#`` drops the fragment.
+    """
+    return base_iri + ref[1:] if ref.startswith(":") else ref
+
+
+def _jsonld_node(node: _Node, base_iri: str) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "@id": _jsonld_iri(f":{node.local}", base_iri),
+        "@type": node.types,
+        "rdfs:label": node.label,
+    }
     for predicate, value in node.head:
-        out[predicate] = _jsonld_value(value)
+        out[predicate] = _jsonld_value(value, base_iri)
     grouped: dict[str, list[Any]] = {}
     for predicate, value in node.statements:
         grouped.setdefault(predicate, []).append(value)
     for predicate, values in grouped.items():
         if len(values) == 1:
-            out[predicate] = _jsonld_value(values[0])
+            out[predicate] = _jsonld_value(values[0], base_iri)
         else:
-            out[predicate] = [_jsonld_value(v) for v in values]
+            out[predicate] = [_jsonld_value(v, base_iri) for v in values]
     return out
 
 
@@ -347,9 +362,9 @@ def export_owl_jsonld(
     classes, relationships = _owl_model(export_bundle(analysis))
     graph: list[dict[str, Any]] = []
     for cls, props in classes:
-        graph.append(_jsonld_node(cls))
-        graph += [_jsonld_node(prop) for prop in props]
-    graph += [_jsonld_node(rel) for rel in relationships]
+        graph.append(_jsonld_node(cls, base_iri))
+        graph += [_jsonld_node(prop, base_iri) for prop in props]
+    graph += [_jsonld_node(rel, base_iri) for rel in relationships]
     return {
         "@context": {
             "@vocab": base_iri,
