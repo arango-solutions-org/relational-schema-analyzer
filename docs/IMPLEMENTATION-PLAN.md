@@ -774,14 +774,31 @@ projection — the whole core (Phases 0–5) landed together in the first releas
   - *Cross-repo.* arango-schema-analyzer needs the new `sample_overlap` default ported
     (arango-schema-analyzer#75). Overlay in the tool contract waits on its agreement (#71).
 
+- **v0.14.0** — **a key overlay through the tool contract.** A minor version because the
+  contract gains a field. Requests without it behave exactly as in 0.13.0.
+  - *`analysisOptions.keyOverlay`* (#71, PR #75). Tool-contract callers can now declare
+    primary, foreign and unique keys for a source whose catalog has none (BigQuery, Glue,
+    Hive), as CLI users could with `--overlay`. `run_tool` applies it through the shared
+    pipeline, the same way to a live source and to `input.physical`. A bad overlay fails
+    the request with `INVALID_REQUEST`, naming the mistake. The MCP `snapshot`, `analyze`,
+    `owl` and `r2rml` tools take it as `key_overlay`.
+  - *Contract.* `request.schema.json` gains `KeyOverlay`, admitting exactly the keys
+    `overlay.py` accepts, with a test that fails if the two drift. It sits in
+    `analysisOptions` beside where arango-schema-analyzer keeps `declaredReferences`, under
+    a different name, because ASA verifies those against the database and an overlay key
+    is asserted, not verified. RSA's request schema is its own copy and already declared
+    relational-only fields (`source`, `input.physical`), so no change on the ASA side was
+    needed. The contract README lists the three.
+  - *CI.* GitHub Actions moved to their Node 24 major versions (#73, PR #74).
+
 Planned next:
 
 - **mcp 2.0 port** — the `[mcp]` extra is pinned `<2` because mcp 2.0 removed the bundled
   `mcp.server.fastmcp` in favour of a new `MCPServer` API (FastMCP moved to its own package).
   `mcp_server.py` targets the 1.x FastMCP API. Porting it is a contained piece of work; until
   then the pin is what keeps the extra installable.
-- **v0.14.0 (target; was v0.13.0 until the audit-fix release took that one, v0.12.0 until the
-  SQLite release took that one, v0.10.0 and v0.11.0
+- **v0.15.0 (target; was v0.14.0 until the key-overlay release took that one, v0.13.0 until
+  the audit-fix release took that one, v0.12.0 until the SQLite release took that one, v0.10.0 and v0.11.0
   until the singularizer releases took those numbers, v0.9.0 until key discovery took that one, and v0.8.0 before bitemporal stamping
   took that one)** — the
   **BigQuery** connector with its cost governor (see
