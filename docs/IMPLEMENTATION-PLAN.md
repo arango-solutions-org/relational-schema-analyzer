@@ -791,14 +791,32 @@ projection — the whole core (Phases 0–5) landed together in the first releas
     needed. The contract README lists the three.
   - *CI.* GitHub Actions moved to their Node 24 major versions (#73, PR #74).
 
+- **v0.15.0** — **empty columns are "not measured", and JSON-LD names Turtle's
+  resources.** A minor version because output changes for both, as below.
+  - *Denormalization probes on an empty sample* (#62, PR #76). `distinct_ratio`,
+    `group_single_valued` and `delimiter_rate` on a column with no non-null value now
+    return `None` ("not measured") on every engine. Postgres, DuckDB, SQLite, MySQL,
+    Databricks and Snowflake returned 0.0, and r2g's cross-source key check
+    (`xsk.py`) read that 0.0 as "hub column is NOT unique" and lowered the key's score;
+    SQL Server and CSV already returned `None`. A genuine zero is still 0.0. No r2g
+    change is needed: it already treats `None` as "not measured". Also,
+    `delimiter_rate` casts to text on Postgres, DuckDB and SQLite, where a non-text
+    column made the query fail (r2g only probes text columns).
+  - *JSON-LD ids are full IRIs* (#63, PR #77). `export_owl_jsonld` wrote `@id` as a bare
+    local name, a relative IRI that a JSON-LD processor resolves against the
+    document's location, so the JSON-LD and Turtle exports named different resources.
+    Every JSON-LD `@id` now carries the base IRI; nothing else in the JSON-LD changes,
+    and Turtle and R2RML are byte-identical. arango-schema-analyzer has the same fix
+    (its PR #79). Open PR #49 (OWL import) needs one test updated when it rebases.
+
 Planned next:
 
 - **mcp 2.0 port** — the `[mcp]` extra is pinned `<2` because mcp 2.0 removed the bundled
   `mcp.server.fastmcp` in favour of a new `MCPServer` API (FastMCP moved to its own package).
   `mcp_server.py` targets the 1.x FastMCP API. Porting it is a contained piece of work; until
   then the pin is what keeps the extra installable.
-- **v0.15.0 (target; was v0.14.0 until the key-overlay release took that one, v0.13.0 until
-  the audit-fix release took that one, v0.12.0 until the SQLite release took that one, v0.10.0 and v0.11.0
+- **v0.16.0 (target; was v0.15.0 until the probe and JSON-LD release took that one, v0.14.0
+  until the key-overlay release took that one, v0.13.0 until the audit-fix release took that one, v0.12.0 until the SQLite release took that one, v0.10.0 and v0.11.0
   until the singularizer releases took those numbers, v0.9.0 until key discovery took that one, and v0.8.0 before bitemporal stamping
   took that one)** — the
   **BigQuery** connector with its cost governor (see
