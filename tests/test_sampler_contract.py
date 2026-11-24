@@ -246,6 +246,36 @@ class TestAnEmptySampleIsNotEvaluated:
         assert score is None, f"{name} scored {score!r} for a column with no values"
 
 
+class TestAnEmptySampleIsNotMeasured:
+    """The denormalization probes on a column with no value: ``None``, never ``0.0`` (#62).
+
+    Six engines answered 0.0 (``GREATEST(COUNT(*), 1)``, ``COALESCE(AVG(...), 0)``) and
+    SQL Server and CSV answered ``None``, so r2g read the same empty column as "measured
+    zero" or "not measured" depending on where it lived. xsk.py, for one, marked a 0.0
+    hub column "NOT unique, weak entity key". Couldn't check is not "no".
+    """
+
+    @pytest.mark.parametrize("name", sorted(EMBEDDED))
+    def test_every_probe_on_an_all_null_column_is_none(self, name, tmp_path):
+        sampler = EMBEDDED[name](tmp_path)()
+        try:
+            got = {
+                "distinct_ratio": sampler.distinct_ratio("orders", "ghost_id"),
+                "delimiter_rate": sampler.delimiter_rate("orders", "ghost_id", ","),
+                "group_single_valued": sampler.group_single_valued(
+                    "orders", ["ghost_id"], "customer_id"
+                ),
+            }
+            # A measured zero must stay a zero: the column has values, none delimited.
+            measured = sampler.delimiter_rate("orders", "customer_id", ",")
+        finally:
+            close = getattr(sampler, "close", None)
+            if close:
+                close()
+        assert got == dict.fromkeys(got), f"{name}: {got}"
+        assert measured == 0.0, f"{name}: a real zero became {measured!r}"
+
+
 class TestKeyProbeCoverage:
     """Which samplers can discover keys from data — and which cannot, on purpose.
 

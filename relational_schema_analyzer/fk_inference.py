@@ -82,7 +82,8 @@ these directly, which is why they are documented rather than made private.
 Two things a consumer should know. Each probe returns ``None`` for "could not
 evaluate" and never raises, so a failed measurement degrades to *unmeasured* rather
 than to a wrong number — treat ``None`` as absence of evidence, not evidence of
-absence. And the ``group_single_valued`` probe is the expensive one: it groups
+absence. A sample with no non-null value is "could not evaluate" too, on every engine,
+not a measured 0.0 (#62). And the ``group_single_valued`` probe is the expensive one: it groups
 rather than scanning, so bound it with the sampler's ``limit`` and, on a
 pay-per-byte engine, a cost ceiling.
 
@@ -1171,7 +1172,7 @@ class PostgresValueSampler:
                 WHERE {self._qi(column)} IS NOT NULL
                 LIMIT %s
             )
-            SELECT COUNT(DISTINCT v)::float / GREATEST(COUNT(*), 1)::float FROM s
+            SELECT COUNT(DISTINCT v)::float / NULLIF(COUNT(*), 0)::float FROM s
         """  # noqa: S608 - identifiers are quoted; schema is from the catalog
         return self._scalar(q, (self.limit,))
 
@@ -1192,7 +1193,7 @@ class PostgresValueSampler:
                 WHERE {not_null}
                 GROUP BY {det}
             )
-            SELECT COALESCE(AVG(CASE WHEN dcount <= 1 THEN 1.0 ELSE 0.0 END), 0)::float
+            SELECT AVG(CASE WHEN dcount <= 1 THEN 1.0 ELSE 0.0 END)::float
             FROM g
         """  # noqa: S608 - identifiers are quoted; schema is from the catalog
         return self._scalar(q, (self.limit,))
@@ -1205,7 +1206,7 @@ class PostgresValueSampler:
                 WHERE {self._qi(column)} IS NOT NULL
                 LIMIT %s
             )
-            SELECT COALESCE(AVG(CASE WHEN strpos(v, %s) > 0 THEN 1.0 ELSE 0.0 END), 0)::float
+            SELECT AVG(CASE WHEN strpos(v::text, %s) > 0 THEN 1.0 ELSE 0.0 END)::float
             FROM s
         """  # noqa: S608 - identifiers are quoted; schema is from the catalog
         return self._scalar(q, (self.limit, delimiter))
@@ -1368,7 +1369,7 @@ class _DerivedTableSampler(_SqlSampler):
     def distinct_ratio(self, table: str, column: str) -> SamplerResult:
         limit, params = self._limit()
         q = f"""
-            SELECT COUNT(DISTINCT v) / GREATEST(COUNT(*), 1) AS ratio
+            SELECT COUNT(DISTINCT v) / NULLIF(COUNT(*), 0) AS ratio
             FROM (
                 SELECT {self._qi(column)} AS v
                 FROM {self._qt(table)}
@@ -1728,7 +1729,7 @@ class DuckDbValueSampler(_SqlSampler):
         return f"CAST({expr} AS VARCHAR)"
 
     def _ratio(self, numerator: str, denominator: str) -> str:
-        return f"{numerator}::DOUBLE / GREATEST({denominator}, 1)::DOUBLE"
+        return f"{numerator}::DOUBLE / NULLIF({denominator}, 0)::DOUBLE"
 
     def _real(self, expr: str) -> str:
         return f"({expr})::DOUBLE"
@@ -1775,7 +1776,7 @@ class DuckDbValueSampler(_SqlSampler):
                     FROM {self._qt(foreign_table)}
                     WHERE {fc} IS NOT NULL
                 )
-                SELECT CASE WHEN COUNT(*) = 0 THEN NULL ELSE {share} END
+                SELECT {share}
                 FROM l LEFT JOIN f ON l.v = f.v
             """  # noqa: S608 - identifiers are quoted; limits are bound ints we own
             row = self._row(q, (self.limit,))
@@ -1802,7 +1803,7 @@ class DuckDbValueSampler(_SqlSampler):
     ) -> SamplerResult:
         det = ", ".join(self._qi(c) for c in determinant_columns)
         not_null = " AND ".join(f"{self._qi(c)} IS NOT NULL" for c in determinant_columns)
-        single = self._real("COALESCE(AVG(CASE WHEN dcount <= 1 THEN 1.0 ELSE 0.0 END), 0)")
+        single = self._real("AVG(CASE WHEN dcount <= 1 THEN 1.0 ELSE 0.0 END)")
         q = f"""
             WITH s AS (
                 SELECT {det}, {self._qi(dependent_column)} AS dep
@@ -1819,8 +1820,8 @@ class DuckDbValueSampler(_SqlSampler):
         return self._scalar(q, (self.limit,))
 
     def delimiter_rate(self, table: str, column: str, delimiter: str) -> SamplerResult:
-        has = self._contains("v", "?")
-        rate = self._real(f"COALESCE(AVG(CASE WHEN {has} THEN 1.0 ELSE 0.0 END), 0)")
+        has = self._contains(self._as_text("v"), "?")  # strpos/instr refuse a non-text column
+        rate = self._real(f"AVG(CASE WHEN {has} THEN 1.0 ELSE 0.0 END)")
         q = f"""
             WITH s AS (
                 SELECT {self._qi(column)} AS v
@@ -1865,7 +1866,7 @@ class SqliteValueSampler(DuckDbValueSampler):
         return f"CAST({expr} AS TEXT)"
 
     def _ratio(self, numerator: str, denominator: str) -> str:
-        return f"CAST({numerator} AS REAL) / max({denominator}, 1)"
+        return f"CAST({numerator} AS REAL) / NULLIF({denominator}, 0)"
 
     def _real(self, expr: str) -> str:
         return f"CAST({expr} AS REAL)"
@@ -2344,7 +2345,7 @@ class SnowflakeValueSampler:
         return self._scalar(
             f"WITH s AS (SELECT {col} AS v FROM {self._table(table)} "  # noqa: S608
             f"WHERE {col} IS NOT NULL LIMIT %s) "
-            "SELECT COUNT(DISTINCT v) / GREATEST(COUNT(*), 1) FROM s",
+            "SELECT COUNT(DISTINCT v) / NULLIF(COUNT(*), 0) FROM s",
             (self.limit,),
         )
 
@@ -2357,7 +2358,7 @@ class SnowflakeValueSampler:
             f"WITH s AS (SELECT {det}, {self._ident(dependent_column)} AS dep "  # noqa: S608
             f"FROM {self._table(table)} LIMIT %s), "
             f"g AS (SELECT {det}, COUNT(DISTINCT dep) AS dcount FROM s WHERE {not_null} GROUP BY {det}) "
-            "SELECT COALESCE(AVG(IFF(dcount <= 1, 1.0, 0.0)), 0) FROM g",
+            "SELECT AVG(IFF(dcount <= 1, 1.0, 0.0)) FROM g",
             (self.limit,),
         )
 
@@ -2366,7 +2367,7 @@ class SnowflakeValueSampler:
         return self._scalar(
             f"WITH s AS (SELECT TO_VARCHAR({col}) AS v FROM {self._table(table)} "  # noqa: S608
             f"WHERE {col} IS NOT NULL LIMIT %s) "
-            "SELECT COALESCE(AVG(IFF(CONTAINS(v, %s), 1.0, 0.0)), 0) FROM s",
+            "SELECT AVG(IFF(CONTAINS(v, %s), 1.0, 0.0)) FROM s",
             (self.limit, delimiter),
         )
 
